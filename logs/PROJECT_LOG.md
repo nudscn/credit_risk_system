@@ -24,3 +24,62 @@
 - Generated Chinese multi-sheet Excel deliverable with actual values: outputs/十堰城运_组织化财务报表_阶段版.xlsx
 - Included sheets: 资产表_组织化, 负债表_组织化, 现金流量表_组织化, 利润表_组织化框架, 填报说明
 - Data source for populated values: 分析底稿-十堰城运.xlsx (assets/liabilities/cashflow)
+- Implemented standards-first workbook builder: scripts/build_basic_data_workbook.py
+- Built single-file deliverable: outputs/十堰城运_基础数据.xlsx
+- Output includes 5 statement sheets + reconciliation + ratios + missing list + per-subject detail sheets
+- Current run periods: 2022/2023/2024; detail sheets: 77; missing rows: 77
+- Expanded reconciliation sheet rules to layered A/B/C checks (identity, roll-up, profit-chain, cashflow-chain, rolling consistency)
+- Added derived fill for cashflow supplemental sheet: 净利润 and 经营活动产生的现金流量净额（补充）
+- Regenerated outputs/十堰城运_基础数据.xlsx with updated rule and fill logic
+- Updated subject detail-sheet policy:
+  - Sheet names now use subject names (e.g., 明细_货币资金)
+  - Detail sheets now include only 资产类、负债类、收入类
+- Regenerated outputs/十堰城运_基础数据.xlsx and verified detail sheet count reduced to 35
+- Added '收入类别' column to income-detail sheets
+- Income detail tagging rules: 主营收入 / 其他收入 / 投资收益
+- Regenerated workbook and verified category tags in income detail sheets
+- Added mock-full mode (--mock-full) to build_basic_data_workbook.py for full synthetic data testing
+- Improved mapping robustness via abbreviation normalization (e.g., cash/equivalent shorthand)
+- Mock-full output now reaches complete fill with no missing rows and full reconciliation pass
+- Output file: outputs/十堰城运_基础数据_模拟全量.xlsx
+- Refactored reconciliation rules to external config file: config/recon_rules_workbook_v1.json
+- build_basic_data_workbook.py now loads reconciliation rules at runtime (enabled/description driven)
+- Enhanced detail-sheet structure:
+  - Added 对方账户 column for 资产/负债类明细
+  - Added 分项收入/子项收入 column for 收入类明细
+  - Introduced configurable coverage behavior in generated detail rows:
+    - 资产/负债类明细覆盖率 50%-70%
+    - 收入类明细覆盖率 >=90%
+- Detail sheets remain display-oriented only (no current validation on detail aggregation)
+- Re-ran mock-full generation; workbook generated successfully with missing rows = 0
+- Re-ran workbook generation in real-source mode.
+- Output: outputs/十堰城运_基础数据.xlsx
+- Run stats: years=2022/2023/2024, detail_sheets=35, missing_rows=48
+- Reconciliation summary: 是=12, 否=22, 待补充=6
+- Missing summary by statement: 资产负债表=2, 利润表=33, 所有者权益变动表=1, 现金流补充资料=12
+- Implemented two-stage single-workbook workflow:
+  - Stage 1 script: scripts/init_basic_workbook.py
+    - creates outputs/十堰城运_基础数据_主文件.xlsx once
+    - skip generation when master workbook already exists
+  - Stage 2 script: scripts/validate_basic_workbook.py
+    - reads master workbook only
+    - refreshes 勾稽校验 + 差异缺失清单
+    - does not overwrite statement data sheets
+- Enhanced scripts/build_basic_data_workbook.py with CLI options:
+  - --output <path>
+  - --skip-if-exists
+- Validation run check passed after year parsing fix:
+  - Years=2022/2023/2024
+  - Recon summary: 是=11, 否=23, 待补充=6
+  - Issue rows=77
+- Added financial ratio rule config: config/financial_ratio_rules_v1.json (18 indicators, expandable)
+- Refactored ratio generation in scripts/build_basic_data_workbook.py:
+  - new loader: load_ratio_cfg()
+  - ratio sheet now fully config-driven by rule IDs/metadata
+- Updated stage-2 validator (scripts/validate_basic_workbook.py):
+  - now refreshes 财务比率 sheet from JSON rules on each validation run
+- Verified output workbook ratio sheet columns and row count (18 indicators x 3 years = 54 rows)
+- Added standalone sheet: 有息负债明细 (same detail level as subject-detail sheets)
+- Updated reconciliation B11 to read left value from 有息负债明细.有息负债合计 (fallback to BS field if present)
+- Stage-2 validator now auto-creates 有息负债明细 if missing, initialized from balance-sheet components
+- Re-validated master workbook: B11 passed for 2022/2023/2024
