@@ -1,0 +1,23 @@
+{
+  "project_id": "hubei_shiyan_city_operation_group",
+  "company_name": "Shiyan City Operation Group Co., Ltd.",
+  "base_currency": "CNY",
+  "base_unit": "CNY_10K",
+  "source_priority": [
+    "audit_report",
+    "analysis_workpaper",
+    "rating_report"
+  ],
+  "periods": ["2022", "2023", "2024"],
+  "input_files": [
+    "/Users/sijia/Documents/湖北十堰/十堰城市运营集团有限公司2022年审计报告.pdf",
+    "/Users/sijia/Documents/湖北十堰/十堰城市运营集团有限公司2023年审计报告.pdf",
+    "/Users/sijia/Documents/湖北十堰/十堰城市运营集团有限公司2024年审计报告.pdf"
+  ],
+  "tolerance": {
+    "abs": 0.5,
+    "pct": 0.001
+  },
+  "output_dir": "/Users/sijia/Documents/credit_risk_system/outputs",
+  "log_dir": "/Users/sijia/Documents/credit_risk_system/logs"
+}

@@ -1,0 +1,38 @@
+{
+  "version": "1.1",
+  "description": "Audit-style anomaly detection rules",
+  "rules": [
+    {
+      "id": "AN_TR_001",
+      "name": "Single-period volatility",
+      "metric": "yoy_change_pct",
+      "operator": "abs_gt",
+      "threshold": 0.3,
+      "severity": "warn"
+    },
+    {
+      "id": "AN_TR_002",
+      "name": "Trend reversal",
+      "metric": "three_year_direction",
+      "operator": "equals",
+      "threshold": "reversal",
+      "severity": "warn"
+    },
+    {
+      "id": "AN_CF_001",
+      "name": "Profit and cashflow mismatch",
+      "metric": "net_profit_vs_operating_cashflow",
+      "operator": "mismatch",
+      "threshold": 0.2,
+      "severity": "error"
+    },
+    {
+      "id": "AN_ST_001",
+      "name": "Structure concentration jump",
+      "metric": "top_item_share_change_pctpt",
+      "operator": "gt",
+      "threshold": 10,
+      "severity": "warn"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "version": "1.1",
+  "description": "Core reconciliation and consistency rules for financial statements",
+  "families": [
+    {
+      "family": "balance_sheet_identity",
+      "rules": [
+        {
+          "id": "BS_EQ_001",
+          "name": "Assets equals liabilities plus equity",
+          "expression": "total_assets = total_liabilities + total_equity",
+          "severity": "error",
+          "required": true
+        },
+        {
+          "id": "BS_EQ_002",
+          "name": "Current and noncurrent assets rollup",
+          "expression": "total_assets = total_current_assets + total_noncurrent_assets",
+          "severity": "warn",
+          "required": true
+        },
+        {
+          "id": "BS_EQ_003",
+          "name": "Current and noncurrent liabilities rollup",
+          "expression": "total_liabilities = total_current_liabilities + total_noncurrent_liabilities",
+          "severity": "warn",
+          "required": true
+        }
+      ]
+    },
+    {
+      "family": "cash_flow_identity",
+      "rules": [
+        {
+          "id": "CF_EQ_001",
+          "name": "Net cash change consistency",
+          "expression": "net_cash_change = net_cash_operating + net_cash_investment + net_cash_financing + fx_impact",
+          "severity": "warn",
+          "required": false
+        }
+      ]
+    },
+    {
+      "family": "period_rollforward",
+      "rules": [
+        {
+          "id": "RF_EQ_001",
+          "name": "Period rollforward",
+          "expression": "ending_balance = opening_balance + period_change",
+          "severity": "error",
+          "required": true
+        }
+      ]
+    },
+    {
+      "family": "subtotal_rollup",
+      "rules": [
+        {
+          "id": "SB_EQ_001",
+          "name": "Subtotal equals sum of children",
+          "expression": "subtotal = sum(child_items)",
+          "severity": "warn",
+          "required": true
+        }
+      ]
+    }
+  ]
+}

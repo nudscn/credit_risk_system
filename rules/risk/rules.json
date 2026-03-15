@@ -1,0 +1,41 @@
+{
+  "version": "1.1",
+  "description": "Risk scoring rules with explainable factors",
+  "grading": {
+    "low": {"min": 0, "max": 39},
+    "medium": {"min": 40, "max": 69},
+    "high": {"min": 70, "max": 100}
+  },
+  "factors": [
+    {
+      "id": "RF_SOLV_001",
+      "name": "Debt pressure",
+      "weight": 20,
+      "trigger": "debt_to_asset_ratio_trending_up"
+    },
+    {
+      "id": "RF_CF_001",
+      "name": "Cash support weakness",
+      "weight": 25,
+      "trigger": "operating_cashflow_negative_or_volatile"
+    },
+    {
+      "id": "RF_PROF_001",
+      "name": "Profitability deterioration",
+      "weight": 20,
+      "trigger": "margin_and_roe_downtrend"
+    },
+    {
+      "id": "RF_RECON_001",
+      "name": "Data consistency risk",
+      "weight": 15,
+      "trigger": "critical_recon_failures"
+    },
+    {
+      "id": "RF_EVENT_001",
+      "name": "External signal risk",
+      "weight": 20,
+      "trigger": "overdue_or_negative_external_events"
+    }
+  ]
+}
