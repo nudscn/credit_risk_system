@@ -25,6 +25,13 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def normalize_project_id(project_id: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z._-]+", "_", (project_id or "").strip())
+    return text or "default_project"
+
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -202,11 +209,13 @@ def extract_pdf_pages(pdf_path: Path) -> Dict[str, Any]:
     return {"engine": engine, "status": "ok", "pages": pages, "ocr_status": ocr_status, "ocr_error": ocr_error}
 
 
-def stage_ingest(config: Dict[str, Any], project_root: Path, log_file: Path) -> Dict[str, Any]:
+def stage_ingest(config: Dict[str, Any], project_root: Path, project_id: str, log_file: Path) -> Dict[str, Any]:
     records: List[Dict[str, Any]] = []
     missing: List[str] = []
     for p in config["input_files"]:
         fp = Path(p)
+        if not fp.is_absolute():
+            fp = project_root / fp
         exists = fp.exists()
         item = {
             "path": str(fp),
@@ -228,7 +237,7 @@ def stage_ingest(config: Dict[str, Any], project_root: Path, log_file: Path) -> 
         "generated_at": utc_now(),
         "records": records,
     }
-    out_path = project_root / "data" / "ingest_manifest.json"
+    out_path = project_root / "data" / project_id / "ingest_manifest.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -240,7 +249,7 @@ def stage_ingest(config: Dict[str, Any], project_root: Path, log_file: Path) -> 
     return out
 
 
-def stage_extract(ingest_manifest: Dict[str, Any], project_root: Path, log_file: Path) -> Dict[str, Any]:
+def stage_extract(ingest_manifest: Dict[str, Any], project_root: Path, project_id: str, log_file: Path) -> Dict[str, Any]:
     alias_cfg = load_json(project_root / "rules" / "mapping" / "aliases.json")
     alias_pairs = alias_cfg.get("aliases", [])
 
@@ -334,7 +343,7 @@ def stage_extract(ingest_manifest: Dict[str, Any], project_root: Path, log_file:
         "per_period_subject_values": per_period,
     }
 
-    out_path = project_root / "outputs" / "extracted_subject_values.json"
+    out_path = project_root / "outputs" / project_id / "extracted_subject_values.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -351,7 +360,7 @@ def stage_extract(ingest_manifest: Dict[str, Any], project_root: Path, log_file:
 
 
 def stage_quality(
-    ingest_manifest: Dict[str, Any], extract_result: Dict[str, Any], project_root: Path, log_file: Path
+    ingest_manifest: Dict[str, Any], extract_result: Dict[str, Any], project_root: Path, project_id: str, log_file: Path
 ) -> Dict[str, Any]:
     issues: List[Dict[str, Any]] = []
 
@@ -428,7 +437,7 @@ def stage_quality(
         "issue_count": len(issues),
         "issues": issues,
     }
-    out_path = project_root / "outputs" / "quality_issues.json"
+    out_path = project_root / "outputs" / project_id / "quality_issues.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -440,7 +449,7 @@ def stage_quality(
     return out
 
 
-def stage_mapping(extract_result: Dict[str, Any], project_root: Path, log_file: Path) -> Dict[str, Any]:
+def stage_mapping(extract_result: Dict[str, Any], project_root: Path, project_id: str, log_file: Path) -> Dict[str, Any]:
     subject_system = load_json(project_root / "rules" / "mapping" / "subject_system.json")
     aliases = load_json(project_root / "rules" / "mapping" / "aliases.json")
     table_counts = {k: len(v) for k, v in subject_system.get("tables", {}).items()}
@@ -462,7 +471,7 @@ def stage_mapping(extract_result: Dict[str, Any], project_root: Path, log_file: 
         "mapped_count": mapped_count,
         "unmapped_items": unmapped_items,
     }
-    out_path = project_root / "outputs" / "mapping_coverage.json"
+    out_path = project_root / "outputs" / project_id / "mapping_coverage.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -479,14 +488,14 @@ def stage_mapping(extract_result: Dict[str, Any], project_root: Path, log_file: 
     return out
 
 
-def stage_variance(config: Dict[str, Any], project_root: Path, log_file: Path) -> Dict[str, Any]:
+def stage_variance(config: Dict[str, Any], project_root: Path, project_id: str, log_file: Path) -> Dict[str, Any]:
     out = {
         "generated_at": utc_now(),
         "source_priority": config.get("source_priority", []),
         "variances": [],
         "note": "Only audit reports loaded. Cross-source variance checks will run after loading workpapers/rating reports.",
     }
-    out_path = project_root / "outputs" / "variance_issues.json"
+    out_path = project_root / "outputs" / project_id / "variance_issues.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -544,7 +553,9 @@ def evaluate_rule(rule_id: str, values: Dict[str, float], tol_abs: float) -> Dic
     return {"status": "pending_data", "diff": None, "required": []}
 
 
-def stage_recon(config: Dict[str, Any], extract_result: Dict[str, Any], project_root: Path, log_file: Path) -> Dict[str, Any]:
+def stage_recon(
+    config: Dict[str, Any], extract_result: Dict[str, Any], project_root: Path, project_id: str, log_file: Path
+) -> Dict[str, Any]:
     recon = load_json(project_root / "rules" / "recon" / "rules.json")
     per_period = extract_result.get("per_period_subject_values", {})
     tol_abs = float(config.get("tolerance", {}).get("abs", 0.5))
@@ -582,7 +593,7 @@ def stage_recon(config: Dict[str, Any], extract_result: Dict[str, Any], project_
         "failed_checks": failed_checks,
         "checks": checks,
     }
-    out_path = project_root / "outputs" / "recon_checklist.json"
+    out_path = project_root / "outputs" / project_id / "recon_checklist.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -599,7 +610,7 @@ def stage_recon(config: Dict[str, Any], extract_result: Dict[str, Any], project_
     return out
 
 
-def stage_analysis(extract_result: Dict[str, Any], project_root: Path, log_file: Path) -> Dict[str, Any]:
+def stage_analysis(extract_result: Dict[str, Any], project_root: Path, project_id: str, log_file: Path) -> Dict[str, Any]:
     indicators = load_json(project_root / "config" / "indicator_set.json")
     anomaly_rules = load_json(project_root / "rules" / "anomaly" / "rules.json")
     per_period = extract_result.get("per_period_subject_values", {})
@@ -652,7 +663,7 @@ def stage_analysis(extract_result: Dict[str, Any], project_root: Path, log_file:
         "analysis_status": "partial" if per_period else "pending_data",
     }
 
-    out_path = project_root / "outputs" / "analysis_plan.json"
+    out_path = project_root / "outputs" / project_id / "analysis_plan.json"
     dump_json(out_path, out)
     log_event(
         log_file,
@@ -674,6 +685,7 @@ def stage_risk(
     recon_result: Dict[str, Any],
     analysis_result: Dict[str, Any],
     project_root: Path,
+    project_id: str,
     log_file: Path,
 ) -> Dict[str, Any]:
     risk_rules = load_json(project_root / "rules" / "risk" / "rules.json")
@@ -726,7 +738,7 @@ def stage_risk(
         "- Load supplemental sources for cross-source variance checks.",
     ]
 
-    report_path = project_root / "outputs" / "risk_report_mvp.md"
+    report_path = project_root / "outputs" / project_id / "risk_report_mvp.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
@@ -757,7 +769,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run MVP credit risk pipeline")
     parser.add_argument(
         "--config",
-        default="/Users/sijia/Documents/credit_risk_system/config/project_config_shiyan.json",
+        default="config/project_config_shiyan.json",
         help="Path to project config JSON",
     )
     return parser.parse_args()
@@ -766,26 +778,29 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
     if not config_path.exists():
         print(f"Config not found: {config_path}")
         return 1
 
     config = load_json(config_path)
-    project_root = Path("/Users/sijia/Documents/credit_risk_system")
-    log_file = project_root / "logs" / "pipeline_events.jsonl"
+    project_root = PROJECT_ROOT
+    project_id = normalize_project_id(str(config.get("project_id", "default_project")))
+    log_file = project_root / "logs" / project_id / "pipeline_events.jsonl"
 
     log_event(log_file, "pipeline", "info", "Pipeline start", {"config": str(config_path)})
 
-    ingest_manifest = stage_ingest(config, project_root, log_file)
-    extract_result = stage_extract(ingest_manifest, project_root, log_file)
-    quality_result = stage_quality(ingest_manifest, extract_result, project_root, log_file)
-    stage_mapping(extract_result, project_root, log_file)
-    stage_variance(config, project_root, log_file)
-    recon_result = stage_recon(config, extract_result, project_root, log_file)
-    analysis_result = stage_analysis(extract_result, project_root, log_file)
-    stage_risk(config, quality_result, recon_result, analysis_result, project_root, log_file)
+    ingest_manifest = stage_ingest(config, project_root, project_id, log_file)
+    extract_result = stage_extract(ingest_manifest, project_root, project_id, log_file)
+    quality_result = stage_quality(ingest_manifest, extract_result, project_root, project_id, log_file)
+    stage_mapping(extract_result, project_root, project_id, log_file)
+    stage_variance(config, project_root, project_id, log_file)
+    recon_result = stage_recon(config, extract_result, project_root, project_id, log_file)
+    analysis_result = stage_analysis(extract_result, project_root, project_id, log_file)
+    stage_risk(config, quality_result, recon_result, analysis_result, project_root, project_id, log_file)
 
-    log_event(log_file, "pipeline", "info", "Pipeline completed", {"project_id": config["project_id"]})
+    log_event(log_file, "pipeline", "info", "Pipeline completed", {"project_id": project_id})
     print("Pipeline run completed. Check outputs/ and logs/.")
     return 0
 

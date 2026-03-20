@@ -1,0 +1,3 @@
+python d:\Python\credit_risk_system\scripts\init_basic_workbook.py --project-id zhonggang_luonai --force --input-dir "d:\Python\credit_risk_system\inputs\中钢洛耐"
+python d:\Python\credit_risk_system\scripts\validate_basic_workbook.py --project-id zhonggang_luonai
+python d:\Python\credit_risk_system\webapp\server.py --host 127.0.0.1 --port 8791

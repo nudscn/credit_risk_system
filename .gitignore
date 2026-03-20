@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 .DS_Store
-inputs/
+inputs/*
 data/
 outputs/
 logs/pipeline_events.jsonl
+!inputs/.gitkeep

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Stage 2 validator for the single master workbook.
 
 Behavior:
@@ -10,41 +10,118 @@ Behavior:
 
 from __future__ import annotations
 
+import argparse
+import datetime as dt
+import json
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import load_workbook
 
 from build_basic_data_workbook import (
     build_missing_sheet,
     build_ratio_sheet,
-    build_recon_sheet,
+    build_recon_sheet_from_template_rules,
+    get_code_aliases,
+    get_interest_debt_items,
+    get_sheet_by_name_loose,
+    load_ratio_alias_map,
     load_ratio_cfg,
-    load_recon_cfg,
+    load_recon_rules,
+    load_runtime_cfg,
 )
 
-PROJECT_ROOT = Path("/Users/sijia/Documents/credit_risk_system")
-MASTER_WORKBOOK = PROJECT_ROOT / "outputs" / "十堰城运_基础数据_主文件.xlsx"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ANALYSIS_TEXT_TEMPLATES = {
+    "asset_abs": "{name}，{y1}年{v1}万元，{y2}年{v2}万元，{y3}年{v3}万元；{y2}年较{y1}年{p21}，{y3}年较{y2}年{p32}。",
+    "liability_abs": "{name}，{y1}年{v1}万元，{y2}年{v2}万元，{y3}年{v3}万元；{y2}年较{y1}年{p21}，{y3}年较{y2}年{p32}。",
+    "asset_total_struct": "资产总计仅描述绝对量变化，不做占比分析。",
+    "asset_subtotal_struct": "占总资产比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+    "asset_item_struct": "{base1_label}：{y1}年{r11}%，{y2}年{r12}%，{y3}年{r13}%；{y2}较{y1}{r121}，{y3}较{y2}{r132}。占总资产比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+    "liability_total_struct": "负债合计仅描述绝对量变化，不做占比分析。",
+    "liability_subtotal_struct": "占负债总计比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+    "liability_item_struct": "{base1_label}：{y1}年{r11}%，{y2}年{r12}%，{y3}年{r13}%；{y2}较{y1}{r121}，{y3}较{y2}{r132}。占负债总计比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+}
 
-STATEMENT_SHEETS = [
-    "资产负债表",
-    "利润表",
-    "现金流量表",
-    "所有者权益变动表",
-    "现金流补充资料",
-]
+
+def normalize_project_id(project_id: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z._-]+", "_", (project_id or "").strip())
+    return text or "default_project"
 
 
-def parse_years(ws) -> List[str]:
+def get_runtime_text(runtime_cfg: Optional[Dict[str, object]], key: str, default: str) -> str:
+    if not isinstance(runtime_cfg, dict):
+        return default
+    val = runtime_cfg.get(key)
+    txt = str(val or "").strip()
+    return txt or default
+
+
+def _render_template(template: str, values: Dict[str, Any]) -> str:
+    txt = str(template or "")
+
+    def repl(match: re.Match) -> str:
+        key = match.group(1)
+        v = values.get(key)
+        return str(v) if v is not None else "待补充"
+
+    return re.sub(r"\{([A-Za-z0-9_]+)\}", repl, txt).strip()
+
+
+def load_analysis_text_templates(runtime_cfg: Optional[Dict[str, object]]) -> Dict[str, str]:
+    cfg = dict(DEFAULT_ANALYSIS_TEXT_TEMPLATES)
+
+    # 1) project config override
+    if isinstance(runtime_cfg, dict):
+        raw = runtime_cfg.get("analysis_text_templates")
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                kk = str(k or "").strip()
+                vv = str(v or "").strip()
+                if kk and vv and "?" not in vv and "�" not in vv:
+                    cfg[kk] = vv
+
+    # 2) rulebook sheet override
+    rb = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    if not rb.exists():
+        return cfg
+    try:
+        wb = load_workbook(rb, data_only=True)
+    except Exception:
+        return cfg
+    ws = get_sheet_by_name_loose(wb, "analysis_text_templates")
+    if ws is None:
+        ws = get_sheet_by_name_loose(wb, "分析文本模板")
+    if ws is None:
+        return cfg
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_key = headers.get("template_key", 1)
+    c_txt = headers.get("template_text", 2)
+    c_enabled = headers.get("enabled", 3)
+    for r in range(2, ws.max_row + 1):
+        enabled_raw = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled_raw in {"0", "false", "no"}:
+            continue
+        key = str(ws.cell(r, c_key).value or "").strip()
+        txt = str(ws.cell(r, c_txt).value or "").strip()
+        if not key or not txt or "?" in txt or "�" in txt:
+            continue
+        cfg[key] = txt
+    return cfg
+
+
+def parse_years(ws, year_row: int = 3, year_start_col: int = 3) -> List[str]:
     years: List[str] = []
-    for cell in ws[1]:
-        text = str(cell.value or "")
-        # Only parse value columns like "2024年（万元）", ignore status columns.
-        m = re.search(r"(\d{4})年（万元）", text)
-        if m:
-            years.append(m.group(1))
-    # Keep order and de-duplicate.
+    current_year = dt.date.today().year
+    for c in range(max(1, year_start_col), ws.max_column + 1):
+        text = str(ws.cell(max(1, year_row), c).value or "")
+        m = re.search(r"(20\d{2})", text)
+        if not m:
+            continue
+        y = int(m.group(1))
+        if 2000 <= y <= current_year + 1:
+            years.append(str(y))
     uniq: List[str] = []
     for y in years:
         if y not in uniq:
@@ -69,6 +146,9 @@ def normalize_num(v):
 def extract_statement_values(ws, years: List[str]) -> Dict[Tuple[str, str], Optional[float]]:
     values: Dict[Tuple[str, str], Optional[float]] = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
+        code = str(row[0] or "").strip()
+        if not re.match(r"^(BS|IS|CF)\d+$", code):
+            continue
         name = row[1]
         if not name:
             continue
@@ -81,7 +161,9 @@ def extract_statement_values(ws, years: List[str]) -> Dict[Tuple[str, str], Opti
 def collect_missing_rows(ws, years: List[str]) -> List[dict]:
     rows: List[dict] = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        code = row[0]
+        code = str(row[0] or "").strip()
+        if not re.match(r"^(BS|IS|CF)\d+$", code):
+            continue
         name = row[1]
         if not name:
             continue
@@ -101,16 +183,17 @@ def collect_missing_rows(ws, years: List[str]) -> List[dict]:
     return rows
 
 
-def collect_recon_issues(wb) -> List[dict]:
+def collect_recon_issues(recon_ws) -> List[dict]:
     issues: List[dict] = []
-    ws = wb["勾稽校验"]
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    if recon_ws is None:
+        return issues
+    for row in recon_ws.iter_rows(min_row=2, values_only=True):
         rule_id, desc, period, left, right, diff, result = row
         if result == "是":
             continue
         issues.append(
             {
-                "报表": "勾稽校验",
+                "报表": recon_ws.title,
                 "科目编码": rule_id,
                 "科目名称": desc,
                 "期间": period,
@@ -121,12 +204,21 @@ def collect_recon_issues(wb) -> List[dict]:
     return issues
 
 
-def create_interest_debt_sheet_if_missing(wb, years: List[str], bs_values: Dict[Tuple[str, str], Optional[float]]) -> None:
-    if "有息负债明细" in wb.sheetnames:
+def create_interest_debt_sheet_if_missing(
+    wb,
+    years: List[str],
+    bs_values: Dict[Tuple[str, str], Optional[float]],
+    runtime_cfg: Optional[Dict[str, object]] = None,
+) -> None:
+    debt_sheet_name = get_runtime_text(runtime_cfg, "interest_debt_sheet_name", "有息负债明细")
+    total_label = get_runtime_text(runtime_cfg, "interest_debt_total_label", "有息负债合计")
+
+    if get_sheet_by_name_loose(wb, debt_sheet_name) is not None:
         return
-    ws = wb.create_sheet("有息负债明细")
+
+    ws = wb.create_sheet(debt_sheet_name)
     ws.append(["期间", "子项", "值(万元)", "说明"])
-    items = ["短期借款", "一年内到期的非流动负债", "长期借款", "应付债券", "租赁负债"]
+    items = get_interest_debt_items(runtime_cfg)
     for y in years:
         total = 0.0
         has_val = False
@@ -136,52 +228,615 @@ def create_interest_debt_sheet_if_missing(wb, years: List[str], bs_values: Dict[
                 total += v
                 has_val = True
             ws.append([y, item, v, "根据资产负债表自动初始化"])
-        ws.append([y, "有息负债合计", round(total, 2) if has_val else None, "根据资产负债表自动初始化"])
+        ws.append([y, total_label, round(total, 2) if has_val else None, "根据资产负债表自动初始化"])
 
 
-def extract_interest_debt_values(wb, years: List[str]) -> Tuple[Dict[Tuple[str, str], Optional[float]], List[dict]]:
+def extract_interest_debt_values(
+    wb,
+    years: List[str],
+    runtime_cfg: Optional[Dict[str, object]] = None,
+) -> Tuple[Dict[Tuple[str, str], Optional[float]], List[dict]]:
     values: Dict[Tuple[str, str], Optional[float]] = {}
     missing_rows: List[dict] = []
-    if "有息负债明细" not in wb.sheetnames:
+
+    debt_sheet_name = get_runtime_text(runtime_cfg, "interest_debt_sheet_name", "有息负债明细")
+    total_label = get_runtime_text(runtime_cfg, "interest_debt_total_label", "有息负债合计")
+
+    ws = get_sheet_by_name_loose(wb, debt_sheet_name)
+    if ws is None:
         return values, missing_rows
 
-    ws = wb["有息负债明细"]
-    # Expected columns: 期间, 子项, 值(万元), 说明
     for row in ws.iter_rows(min_row=2, values_only=True):
         period, item, val, _ = row
-        if str(item or "") != "有息负债合计":
+        if str(item or "").strip() != total_label:
             continue
-        y = str(period or "")
+        y = str(period or "").strip()
         if y not in years:
             continue
         n = normalize_num(val)
-        values[("有息负债合计", y)] = n
+        values[(total_label, y)] = n
         if n is None:
             missing_rows.append(
                 {
-                    "报表": "有息负债明细",
+                    "报表": ws.title,
                     "科目编码": "DEBT999",
-                    "科目名称": "有息负债合计",
+                    "科目名称": total_label,
                     "期间": y,
                     "状态": "待补充",
-                    "说明": "有息负债合计为空，请补录或修正",
+                    "说明": f"{total_label}为空，请补录或修正",
                 }
             )
     return values, missing_rows
 
 
+def load_ratio_candidates(project_id: str) -> List[Path]:
+    manifest_path = PROJECT_ROOT / "data" / project_id / "input_discovery.json"
+    if not manifest_path.exists():
+        return []
+    try:
+        cfg = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    selected = cfg.get("selected_workpaper")
+    if not selected:
+        return []
+    p = Path(selected)
+    return [p] if p.exists() else []
+
+
+def _bs_code_num(code: str) -> Optional[int]:
+    m = re.match(r"^BS(\d+)$", str(code or "").strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _safe_div(numer: Optional[float], denom: Optional[float]) -> Optional[float]:
+    if numer is None or denom in (None, 0):
+        return None
+    return numer / denom
+
+
+def _pct_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
+    if curr is None or prev in (None, 0):
+        return None
+    return (curr - prev) / abs(prev) * 100.0
+
+
+def _abs_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
+    if curr is None or prev is None:
+        return None
+    return curr - prev
+
+
+def _change_label(pct_value: Optional[float], stable_pct: float = 2.0) -> str:
+    if pct_value is None:
+        return "待补充"
+    if pct_value > stable_pct:
+        return "增加"
+    if pct_value < -stable_pct:
+        return "减少"
+    return "保持稳定"
+
+
+def _share_label(delta_pct: Optional[float], stable_pct: float = 2.0) -> str:
+    if delta_pct is None:
+        return "待补充"
+    if delta_pct > stable_pct:
+        return "上升"
+    if delta_pct < -stable_pct:
+        return "下降"
+    return "基本稳定"
+
+
+def _fmt_num(v: Optional[float], digits: int = 2) -> str:
+    if v is None:
+        return "待补充"
+    return f"{v:.{digits}f}"
+
+
+def _scale_phrase(pct_value: Optional[float], stable_pct: float = 2.0) -> str:
+    if pct_value is None:
+        return "待补充"
+    if pct_value > stable_pct:
+        return f"增加{_fmt_num(abs(pct_value))}%"
+    if pct_value < -stable_pct:
+        return f"减少{_fmt_num(abs(pct_value))}%"
+    return f"保持稳定（变动{_fmt_num(abs(pct_value))}%）"
+
+
+def _struct_phrase(delta_pct: Optional[float], stable_pct: float = 2.0) -> str:
+    if delta_pct is None:
+        return "待补充"
+    if delta_pct > stable_pct:
+        return f"上升{_fmt_num(abs(delta_pct))}个百分点"
+    if delta_pct < -stable_pct:
+        return f"下降{_fmt_num(abs(delta_pct))}个百分点"
+    return f"基本稳定（变动{_fmt_num(abs(delta_pct))}个百分点）"
+
+
+def _replace_sheet(wb, sheet_name: str):
+    old = get_sheet_by_name_loose(wb, sheet_name)
+    if old is not None:
+        del wb[old.title]
+    return wb.create_sheet(sheet_name)
+
+
+def build_asset_analysis_sheets(
+    wb,
+    bs_ws,
+    years: List[str],
+    stable_threshold_pct: float = 2.0,
+    current_total_code: str = "BS027",
+    noncurrent_total_code: str = "BS056",
+    asset_total_code: str = "BS057",
+    text_templates: Optional[Dict[str, str]] = None,
+) -> None:
+    if len(years) < 3:
+        return
+
+    y1, y2, y3 = years[0], years[1], years[2]
+    tpl = dict(DEFAULT_ANALYSIS_TEXT_TEMPLATES)
+    tpl.update(text_templates or {})
+
+    rows: List[dict] = []
+    code_year_values: Dict[str, Dict[str, Optional[float]]] = {}
+
+    for r in range(2, bs_ws.max_row + 1):
+        code = str(bs_ws.cell(r, 1).value or "").strip()
+        name = str(bs_ws.cell(r, 2).value or "").strip()
+        n = _bs_code_num(code)
+        if n is None or n > 57:
+            continue
+        vals = {
+            y1: normalize_num(bs_ws.cell(r, 3).value),
+            y2: normalize_num(bs_ws.cell(r, 4).value),
+            y3: normalize_num(bs_ws.cell(r, 5).value),
+        }
+        # Skip pure section rows.
+        if (name.endswith("：") or name.endswith(":")) and all(v is None for v in vals.values()):
+            continue
+        code_year_values[code] = vals
+        rows.append({"code": code, "code_num": n, "name": name, "values": vals})
+
+    current_totals = code_year_values.get(current_total_code, {})
+    noncurrent_totals = code_year_values.get(noncurrent_total_code, {})
+    asset_totals = code_year_values.get(asset_total_code, {})
+
+    ws_scale = _replace_sheet(wb, "分析_规模变化_资产类")
+    ws_scale.append(
+        [
+            "科目编码",
+            "科目名称",
+            f"{y1}年(万元)",
+            f"{y2}年(万元)",
+            f"{y3}年(万元)",
+            f"{y2}较{y1}变动额(万元)",
+            f"{y2}较{y1}变动率(%)",
+            f"{y2}较{y1}变化判断",
+            f"{y3}较{y2}变动额(万元)",
+            f"{y3}较{y2}变动率(%)",
+            f"{y3}较{y2}变化判断",
+            "定量描述_绝对量",
+        ]
+    )
+
+    ws_struct = _replace_sheet(wb, "分析_结构占比_资产类")
+    ws_struct.append(
+        [
+            "科目编码",
+            "科目名称",
+            "结构口径1",
+            f"{y1}年口径1占比(%)",
+            f"{y2}年口径1占比(%)",
+            f"{y3}年口径1占比(%)",
+            f"{y2}较{y1}口径1变动(百分点)",
+            f"{y3}较{y2}口径1变动(百分点)",
+            f"{y1}年占总资产比例(%)",
+            f"{y2}年占总资产比例(%)",
+            f"{y3}年占总资产比例(%)",
+            f"{y2}较{y1}占总资产变动(百分点)",
+            f"{y3}较{y2}占总资产变动(百分点)",
+            "结构变化判断",
+            "定量描述_相对量",
+        ]
+    )
+
+    for item in rows:
+        code = item["code"]
+        name = item["name"]
+        n = item["code_num"]
+        v1 = item["values"].get(y1)
+        v2 = item["values"].get(y2)
+        v3 = item["values"].get(y3)
+
+        d21 = _abs_change(v2, v1)
+        p21 = _pct_change(v2, v1)
+        d32 = _abs_change(v3, v2)
+        p32 = _pct_change(v3, v2)
+        l21 = _change_label(p21, stable_pct=stable_threshold_pct)
+        l32 = _change_label(p32, stable_pct=stable_threshold_pct)
+
+        abs_text = _render_template(
+            tpl["asset_abs"],
+            {
+                "name": name,
+                "y1": y1,
+                "y2": y2,
+                "y3": y3,
+                "v1": _fmt_num(v1),
+                "v2": _fmt_num(v2),
+                "v3": _fmt_num(v3),
+                "p21": _scale_phrase(p21, stable_pct=stable_threshold_pct),
+                "p32": _scale_phrase(p32, stable_pct=stable_threshold_pct),
+            },
+        )
+
+        ws_scale.append(
+            [
+                code,
+                name,
+                v1,
+                v2,
+                v3,
+                d21,
+                p21,
+                l21,
+                d32,
+                p32,
+                l32,
+                abs_text,
+            ]
+        )
+
+        # Relative structure: asset total row only keeps absolute changes (no ratio narrative).
+        ratio_base1_name = ""
+        r1_1 = r1_2 = r1_3 = None
+        r1_d21 = r1_d32 = None
+        rt_1 = _safe_div(v1, asset_totals.get(y1))
+        rt_2 = _safe_div(v2, asset_totals.get(y2))
+        rt_3 = _safe_div(v3, asset_totals.get(y3))
+        rt_d21 = (rt_2 - rt_1) * 100 if rt_2 is not None and rt_1 is not None else None
+        rt_d32 = (rt_3 - rt_2) * 100 if rt_3 is not None and rt_2 is not None else None
+        struct_label = _share_label(rt_d32, stable_pct=stable_threshold_pct)
+        struct_text = ""
+
+        if code == asset_total_code:
+            struct_label = "不适用"
+            struct_text = _render_template(tpl["asset_total_struct"], {})
+        elif code in {current_total_code, noncurrent_total_code}:
+            struct_label = _share_label(rt_d32, stable_pct=stable_threshold_pct)
+            struct_text = _render_template(
+                tpl["asset_subtotal_struct"],
+                {
+                    "y1": y1,
+                    "y2": y2,
+                    "y3": y3,
+                    "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct),
+                },
+            )
+        else:
+            if n <= 27:
+                ratio_base1_name = "占流动资产比例"
+                b1_1 = current_totals.get(y1)
+                b1_2 = current_totals.get(y2)
+                b1_3 = current_totals.get(y3)
+            else:
+                ratio_base1_name = "占非流动资产比例"
+                b1_1 = noncurrent_totals.get(y1)
+                b1_2 = noncurrent_totals.get(y2)
+                b1_3 = noncurrent_totals.get(y3)
+
+            r1_1 = _safe_div(v1, b1_1)
+            r1_2 = _safe_div(v2, b1_2)
+            r1_3 = _safe_div(v3, b1_3)
+            r1_d21 = (r1_2 - r1_1) * 100 if r1_2 is not None and r1_1 is not None else None
+            r1_d32 = (r1_3 - r1_2) * 100 if r1_3 is not None and r1_2 is not None else None
+            struct_label = _share_label(r1_d32, stable_pct=stable_threshold_pct)
+            struct_text = _render_template(
+                tpl["asset_item_struct"],
+                {
+                    "base1_label": ratio_base1_name,
+                    "y1": y1,
+                    "y2": y2,
+                    "y3": y3,
+                    "r11": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
+                    "r12": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
+                    "r13": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
+                    "r121": _struct_phrase(r1_d21, stable_pct=stable_threshold_pct),
+                    "r132": _struct_phrase(r1_d32, stable_pct=stable_threshold_pct),
+                    "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct),
+                },
+            )
+
+        ws_struct.append(
+            [
+                code,
+                name,
+                ratio_base1_name,
+                r1_1 * 100 if r1_1 is not None else None,
+                r1_2 * 100 if r1_2 is not None else None,
+                r1_3 * 100 if r1_3 is not None else None,
+                r1_d21,
+                r1_d32,
+                rt_1 * 100 if rt_1 is not None else None,
+                rt_2 * 100 if rt_2 is not None else None,
+                rt_3 * 100 if rt_3 is not None else None,
+                rt_d21,
+                rt_d32,
+                struct_label,
+                struct_text,
+            ]
+        )
+
+
+def build_liability_analysis_sheets(
+    wb,
+    bs_ws,
+    years: List[str],
+    stable_threshold_pct: float = 2.0,
+    current_total_code: str = "BS089",
+    noncurrent_total_code: str = "BS102",
+    liability_total_code: str = "BS103",
+    text_templates: Optional[Dict[str, str]] = None,
+) -> None:
+    if len(years) < 3:
+        return
+
+    y1, y2, y3 = years[0], years[1], years[2]
+    tpl = dict(DEFAULT_ANALYSIS_TEXT_TEMPLATES)
+    tpl.update(text_templates or {})
+
+    rows: List[dict] = []
+    code_year_values: Dict[str, Dict[str, Optional[float]]] = {}
+
+    for r in range(2, bs_ws.max_row + 1):
+        code = str(bs_ws.cell(r, 1).value or "").strip()
+        name = str(bs_ws.cell(r, 2).value or "").strip()
+        n = _bs_code_num(code)
+        if n is None or n < 58 or n > 103:
+            continue
+        vals = {
+            y1: normalize_num(bs_ws.cell(r, 3).value),
+            y2: normalize_num(bs_ws.cell(r, 4).value),
+            y3: normalize_num(bs_ws.cell(r, 5).value),
+        }
+        if (name.endswith("：") or name.endswith(":")) and all(v is None for v in vals.values()):
+            continue
+        code_year_values[code] = vals
+        rows.append({"code": code, "code_num": n, "name": name, "values": vals})
+
+    current_totals = code_year_values.get(current_total_code, {})
+    noncurrent_totals = code_year_values.get(noncurrent_total_code, {})
+    liability_totals = code_year_values.get(liability_total_code, {})
+
+    ws_scale = _replace_sheet(wb, "分析_规模变化_负债类")
+    ws_scale.append(
+        [
+            "科目编码",
+            "科目名称",
+            f"{y1}年(万元)",
+            f"{y2}年(万元)",
+            f"{y3}年(万元)",
+            f"{y2}较{y1}变动额(万元)",
+            f"{y2}较{y1}变动率(%)",
+            f"{y2}较{y1}变化判断",
+            f"{y3}较{y2}变动额(万元)",
+            f"{y3}较{y2}变动率(%)",
+            f"{y3}较{y2}变化判断",
+            "定量描述_绝对量",
+        ]
+    )
+
+    ws_struct = _replace_sheet(wb, "分析_结构占比_负债类")
+    ws_struct.append(
+        [
+            "科目编码",
+            "科目名称",
+            "结构口径1",
+            f"{y1}年口径1占比(%)",
+            f"{y2}年口径1占比(%)",
+            f"{y3}年口径1占比(%)",
+            f"{y2}较{y1}口径1变动(百分点)",
+            f"{y3}较{y2}口径1变动(百分点)",
+            f"{y1}年占负债总计比例(%)",
+            f"{y2}年占负债总计比例(%)",
+            f"{y3}年占负债总计比例(%)",
+            f"{y2}较{y1}占负债总计变动(百分点)",
+            f"{y3}较{y2}占负债总计变动(百分点)",
+            "结构变化判断",
+            "定量描述_相对量",
+        ]
+    )
+
+    for item in rows:
+        code = item["code"]
+        name = item["name"]
+        n = item["code_num"]
+        v1 = item["values"].get(y1)
+        v2 = item["values"].get(y2)
+        v3 = item["values"].get(y3)
+
+        d21 = _abs_change(v2, v1)
+        p21 = _pct_change(v2, v1)
+        d32 = _abs_change(v3, v2)
+        p32 = _pct_change(v3, v2)
+        l21 = _change_label(p21, stable_pct=stable_threshold_pct)
+        l32 = _change_label(p32, stable_pct=stable_threshold_pct)
+
+        abs_text = _render_template(
+            tpl["liability_abs"],
+            {
+                "name": name,
+                "y1": y1,
+                "y2": y2,
+                "y3": y3,
+                "v1": _fmt_num(v1),
+                "v2": _fmt_num(v2),
+                "v3": _fmt_num(v3),
+                "p21": _scale_phrase(p21, stable_pct=stable_threshold_pct),
+                "p32": _scale_phrase(p32, stable_pct=stable_threshold_pct),
+            },
+        )
+
+        ws_scale.append(
+            [
+                code,
+                name,
+                v1,
+                v2,
+                v3,
+                d21,
+                p21,
+                l21,
+                d32,
+                p32,
+                l32,
+                abs_text,
+            ]
+        )
+
+        ratio_base1_name = ""
+        r1_1 = r1_2 = r1_3 = None
+        r1_d21 = r1_d32 = None
+        rt_1 = _safe_div(v1, liability_totals.get(y1))
+        rt_2 = _safe_div(v2, liability_totals.get(y2))
+        rt_3 = _safe_div(v3, liability_totals.get(y3))
+        rt_d21 = (rt_2 - rt_1) * 100 if rt_2 is not None and rt_1 is not None else None
+        rt_d32 = (rt_3 - rt_2) * 100 if rt_3 is not None and rt_2 is not None else None
+        struct_label = _share_label(rt_d32, stable_pct=stable_threshold_pct)
+        struct_text = ""
+
+        if code == liability_total_code:
+            struct_label = "不适用"
+            struct_text = _render_template(tpl["liability_total_struct"], {})
+        elif code in {current_total_code, noncurrent_total_code}:
+            struct_text = _render_template(
+                tpl["liability_subtotal_struct"],
+                {
+                    "y1": y1,
+                    "y2": y2,
+                    "y3": y3,
+                    "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct),
+                },
+            )
+        else:
+            if n <= 89:
+                ratio_base1_name = "占流动负债比例"
+                b1_1 = current_totals.get(y1)
+                b1_2 = current_totals.get(y2)
+                b1_3 = current_totals.get(y3)
+            else:
+                ratio_base1_name = "占非流动负债比例"
+                b1_1 = noncurrent_totals.get(y1)
+                b1_2 = noncurrent_totals.get(y2)
+                b1_3 = noncurrent_totals.get(y3)
+
+            r1_1 = _safe_div(v1, b1_1)
+            r1_2 = _safe_div(v2, b1_2)
+            r1_3 = _safe_div(v3, b1_3)
+            r1_d21 = (r1_2 - r1_1) * 100 if r1_2 is not None and r1_1 is not None else None
+            r1_d32 = (r1_3 - r1_2) * 100 if r1_3 is not None and r1_2 is not None else None
+            struct_label = _share_label(r1_d32, stable_pct=stable_threshold_pct)
+            struct_text = _render_template(
+                tpl["liability_item_struct"],
+                {
+                    "base1_label": ratio_base1_name,
+                    "y1": y1,
+                    "y2": y2,
+                    "y3": y3,
+                    "r11": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
+                    "r12": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
+                    "r13": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
+                    "r121": _struct_phrase(r1_d21, stable_pct=stable_threshold_pct),
+                    "r132": _struct_phrase(r1_d32, stable_pct=stable_threshold_pct),
+                    "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct),
+                },
+            )
+
+        ws_struct.append(
+            [
+                code,
+                name,
+                ratio_base1_name,
+                r1_1 * 100 if r1_1 is not None else None,
+                r1_2 * 100 if r1_2 is not None else None,
+                r1_3 * 100 if r1_3 is not None else None,
+                r1_d21,
+                r1_d32,
+                rt_1 * 100 if rt_1 is not None else None,
+                rt_2 * 100 if rt_2 is not None else None,
+                rt_3 * 100 if rt_3 is not None else None,
+                rt_d21,
+                rt_d32,
+                struct_label,
+                struct_text,
+            ]
+        )
+
+
 def main() -> int:
-    if not MASTER_WORKBOOK.exists():
-        print(f"Master workbook not found: {MASTER_WORKBOOK}")
+    parser = argparse.ArgumentParser(description="Validate single master workbook (stage 2)")
+    parser.add_argument(
+        "--project-id",
+        default="default_project",
+        help="Project identifier used for output isolation (default: default_project)",
+    )
+    parser.add_argument(
+        "--master-workbook",
+        default="",
+        help="Master workbook path override; default is outputs/<project_id>/<project_id>_项目主文件.xlsx",
+    )
+    args = parser.parse_args()
+
+    runtime_cfg = load_runtime_cfg()
+    project_id = normalize_project_id(args.project_id)
+
+    if args.master_workbook:
+        master_workbook = Path(args.master_workbook)
+        if not master_workbook.is_absolute():
+            master_workbook = PROJECT_ROOT / master_workbook
+    else:
+        master_workbook = PROJECT_ROOT / "outputs" / project_id / f"{project_id}_项目主文件.xlsx"
+
+    if not master_workbook.exists():
+        print(f"Master workbook not found: {master_workbook}")
         print("Please run stage 1 first: scripts/init_basic_workbook.py")
         return 1
 
-    wb = load_workbook(MASTER_WORKBOOK)
-    if "资产负债表" not in wb.sheetnames:
+    wb = load_workbook(master_workbook)
+    bs_sheet_candidates = runtime_cfg.get("bs_sheet_candidates", ["资产负债表", "资产负债表 "])
+    bs_ws = None
+    for sname in bs_sheet_candidates:
+        bs_ws = get_sheet_by_name_loose(wb, str(sname))
+        if bs_ws is not None:
+            break
+    if bs_ws is None:
         print("Master workbook is invalid: missing 资产负债表 sheet")
         return 1
 
-    years = parse_years(wb["资产负债表"])
+    year_row = int(runtime_cfg.get("year_header_row", 3))
+    year_start_col = int(runtime_cfg.get("year_start_col", 3))
+    years = parse_years(bs_ws, year_row=year_row, year_start_col=year_start_col)
     if not years:
         print("Cannot detect years from 资产负债表 header")
         return 1
@@ -189,57 +844,97 @@ def main() -> int:
     all_values: Dict[str, Dict[Tuple[str, str], Optional[float]]] = {}
     missing_rows: List[dict] = []
 
-    for sname in STATEMENT_SHEETS:
-        if sname not in wb.sheetnames:
+    statement_sheets = runtime_cfg.get("statement_sheets", [])
+    visited_statement_titles = set()
+    for sname in statement_sheets:
+        ws = get_sheet_by_name_loose(wb, str(sname))
+        if ws is None:
             continue
-        ws = wb[sname]
-        all_values[sname] = extract_statement_values(ws, years)
+        if ws.title in visited_statement_titles:
+            continue
+        visited_statement_titles.add(ws.title)
+        canonical = ws.title.strip()
+        all_values[canonical] = extract_statement_values(ws, years)
         missing_rows.extend(collect_missing_rows(ws, years))
 
-    create_interest_debt_sheet_if_missing(wb, years, all_values.get("资产负债表", {}))
-    debt_values, debt_missing = extract_interest_debt_values(wb, years)
+    create_interest_debt_sheet_if_missing(wb, years, all_values.get("资产负债表", {}), runtime_cfg=runtime_cfg)
+    debt_values, debt_missing = extract_interest_debt_values(wb, years, runtime_cfg=runtime_cfg)
     if debt_values:
-        all_values["有息负债明细"] = debt_values
+        all_values[get_runtime_text(runtime_cfg, "interest_debt_sheet_name", "有息负债明细")] = debt_values
     missing_rows.extend(debt_missing)
 
-    for name in ["勾稽校验", "财务比率", "差异缺失清单"]:
-        if name in wb.sheetnames:
-            del wb[name]
+    delete_sheet_names = runtime_cfg.get("rebuild_sheets", []) + runtime_cfg.get("drop_sheets", [])
+    for name in delete_sheet_names:
+        ws = get_sheet_by_name_loose(wb, str(name))
+        if ws is not None:
+            del wb[ws.title]
 
-    recon_cfg = load_recon_cfg()
+    recon_rules = load_recon_rules()
+    ratio_alias_map = load_ratio_alias_map()
     ratio_cfg = load_ratio_cfg()
-    build_recon_sheet(wb, years, all_values, recon_cfg)
-    build_ratio_sheet(wb, years, all_values, ratio_cfg)
+    tolerance_abs = float(runtime_cfg.get("recon_tolerance_abs", 1.0))
+    code_aliases = get_code_aliases(runtime_cfg)
 
-    missing_rows.extend(collect_recon_issues(wb))
+    build_recon_sheet_from_template_rules(wb, years, recon_rules, tolerance_abs, code_aliases=code_aliases)
+    ratio_candidates = load_ratio_candidates(project_id)
+    build_ratio_sheet(
+        wb,
+        years,
+        all_values,
+        ratio_cfg,
+        ratio_candidates,
+        ratio_alias_map,
+        runtime_cfg=runtime_cfg,
+    )
+
+    recon_ws = get_sheet_by_name_loose(wb, "勾稽校验")
+    missing_rows.extend(collect_recon_issues(recon_ws))
     build_missing_sheet(wb, missing_rows)
+    stable_threshold_pct = float(runtime_cfg.get("analysis_stable_threshold_pct", 2.0))
+    analysis_text_templates = load_analysis_text_templates(runtime_cfg)
+    build_asset_analysis_sheets(
+        wb,
+        bs_ws,
+        years,
+        stable_threshold_pct=stable_threshold_pct,
+        current_total_code=str(runtime_cfg.get("asset_current_total_code", "BS027")),
+        noncurrent_total_code=str(runtime_cfg.get("asset_noncurrent_total_code", "BS056")),
+        asset_total_code=str(runtime_cfg.get("asset_total_code", "BS057")),
+        text_templates=analysis_text_templates,
+    )
+    build_liability_analysis_sheets(
+        wb,
+        bs_ws,
+        years,
+        stable_threshold_pct=stable_threshold_pct,
+        current_total_code=str(runtime_cfg.get("liability_current_total_code", "BS089")),
+        noncurrent_total_code=str(runtime_cfg.get("liability_noncurrent_total_code", "BS102")),
+        liability_total_code=str(runtime_cfg.get("liability_total_code", "BS103")),
+        text_templates=analysis_text_templates,
+    )
 
-    first_order = [
-        "资产负债表",
-        "利润表",
-        "现金流量表",
-        "所有者权益变动表",
-        "现金流补充资料",
-        "有息负债明细",
-        "勾稽校验",
-        "财务比率",
-        "差异缺失清单",
-    ]
-    wb._sheets.sort(key=lambda ws: first_order.index(ws.title) if ws.title in first_order else 100)
+    first_order = runtime_cfg.get("sheet_order", [])
+    if first_order:
+        wb._sheets.sort(key=lambda ws: first_order.index(ws.title) if ws.title in first_order else 100)
 
-    wb.save(MASTER_WORKBOOK)
+    wb.save(master_workbook)
+
+    recon_ws = get_sheet_by_name_loose(wb, "勾稽校验")
+    if recon_ws is None:
+        print("Validation failed: missing 勾稽校验 sheet after rebuild")
+        return 1
 
     recon_yes = recon_no = recon_pending = 0
-    for row in wb["勾稽校验"].iter_rows(min_row=2, values_only=True):
-        r = row[6]
-        if r == "是":
+    for row in recon_ws.iter_rows(min_row=2, values_only=True):
+        result = str(row[6] or "").strip()
+        if result == "是":
             recon_yes += 1
-        elif r == "否":
+        elif result == "否":
             recon_no += 1
         else:
             recon_pending += 1
 
-    print(f"Validated: {MASTER_WORKBOOK}")
+    print(f"Validated: {master_workbook}")
     print(f"Years: {', '.join(years)}")
     print(f"Recon summary: 是={recon_yes}, 否={recon_no}, 待补充={recon_pending}")
     print(f"Issue rows: {len(missing_rows)}")
