@@ -52,6 +52,32 @@ INCOME_RULEBOOK_PATH = PROJECT_ROOT / "config" / "income_profit_rulebook_skeleto
 INCOME_RULEBOOK_FALLBACK_PATH = PROJECT_ROOT / "config" / "rulebook.xlsx"
 RATIO_RULEBOOK_PATH = PROJECT_ROOT / "config" / "ratio_analysis_rulebook.xlsx"
 KEY_RATIO_RULEBOOK_PATH = PROJECT_ROOT / "config" / "key_ratio_rulebook.xlsx"
+RULE_EDIT_SOURCES = [
+    {
+        "source_id": "rulebook_main",
+        "label": "资产负债分析规则（rulebook.xlsx）",
+        "path": PROJECT_ROOT / "config" / "rulebook.xlsx",
+        "sheets": ["analysis_text_templates"],
+    },
+    {
+        "source_id": "ratio_rulebook",
+        "label": "财务指标规则（ratio_analysis_rulebook.xlsx）",
+        "path": PROJECT_ROOT / "config" / "ratio_analysis_rulebook.xlsx",
+        "sheets": ["text_templates", "display_policy"],
+    },
+    {
+        "source_id": "income_rulebook",
+        "label": "收入利润规则（income_profit_rulebook_skeleton.xlsx）",
+        "path": PROJECT_ROOT / "config" / "income_profit_rulebook_skeleton.xlsx",
+        "sheets": ["text_templates", "trend_thresholds"],
+    },
+    {
+        "source_id": "key_ratio_rulebook",
+        "label": "重点指标规则（key_ratio_rulebook.xlsx）",
+        "path": PROJECT_ROOT / "config" / "key_ratio_rulebook.xlsx",
+        "sheets": ["narrative_templates", "driver_thresholds"],
+    },
+]
 DEFAULT_INCOME_SPECIAL_ITEMS = [
     {"node_id": "2.1.2.1", "label": "其他收益（政府补助等）", "code_candidates": [], "name_keywords": ["其他收益"]},
     {"node_id": "2.1.2.2", "label": "信用减值损失", "code_candidates": [], "name_keywords": ["信用减值损失"]},
@@ -1793,8 +1819,24 @@ def build_analysis_map(wb, project_id: str, sheet_map: Dict[str, List[str]], gro
             continue
         scale_row = scale_by_code.get(code, {})
         struct_row = struct_by_code.get(code, {})
-        auto_abs = str(scale_row.get("定量描述_绝对量", "") or "")
-        auto_rel = str(struct_row.get("定量描述_相对量", "") or "")
+        raw_name = str(scale_row.get("科目名称", "") or struct_row.get("科目名称", ""))
+        clean_name = raw_name.strip().rstrip("：:").strip()
+
+        def _clean_subject_punct(text: str) -> str:
+            t = str(text or "")
+            if not t:
+                return t
+            # Remove stale punctuation artifacts from legacy generated sheets, e.g. "流动资产：，".
+            t = t.replace("：，", "，").replace(":,", "，")
+            if raw_name and clean_name and raw_name != clean_name:
+                t = t.replace(f"{raw_name}，", f"{clean_name}，")
+                t = t.replace(f"{raw_name},", f"{clean_name},")
+                # Guard case: "名称："
+                t = t.replace(f"{raw_name}", clean_name)
+            return t
+
+        auto_abs = _clean_subject_punct(str(scale_row.get("定量描述_绝对量", "") or ""))
+        auto_rel = _clean_subject_punct(str(struct_row.get("定量描述_相对量", "") or ""))
         auto_combined = auto_abs if not auto_rel else f"{auto_abs}\n{auto_rel}"
 
         saved = entries.get(make_entry_key(group_id, code), {})
@@ -1806,7 +1848,7 @@ def build_analysis_map(wb, project_id: str, sheet_map: Dict[str, List[str]], gro
 
         out[code] = {
             "code": code,
-            "name": str(scale_row.get("科目名称", "") or struct_row.get("科目名称", "")),
+            "name": clean_name,
             "auto_abs": auto_abs,
             "auto_rel": auto_rel,
             "auto_combined": auto_combined,
@@ -1936,6 +1978,128 @@ def list_projects() -> List[str]:
     return sorted([p.name for p in out_root.iterdir() if p.is_dir()])
 
 
+def _get_rule_source(source_id: str) -> Optional[Dict[str, Any]]:
+    sid = str(source_id or "").strip()
+    return next((x for x in RULE_EDIT_SOURCES if str(x.get("source_id")) == sid), None)
+
+
+def _rule_catalog() -> List[Dict[str, Any]]:
+    items = []
+    for x in RULE_EDIT_SOURCES:
+        p = Path(x["path"])
+        items.append(
+            {
+                "source_id": str(x["source_id"]),
+                "label": str(x["label"]),
+                "path": str(p),
+                "exists": p.exists(),
+                "sheets": list(x.get("sheets", [])),
+            }
+        )
+    return items
+
+
+def _read_rule_sheet(source_id: str, sheet_name: str) -> Dict[str, Any]:
+    src = _get_rule_source(source_id)
+    if not src:
+        raise ValueError("unknown source_id")
+    p = Path(src["path"])
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    wb = load_workbook(p, data_only=False)
+    ws = get_sheet_by_loose_name(wb, [sheet_name])
+    if ws is None:
+        raise ValueError(f"sheet not found: {sheet_name}")
+    headers = [str(ws.cell(1, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+    if not any(headers):
+        headers = [f"col_{c}" for c in range(1, ws.max_column + 1)]
+    rows: List[Dict[str, Any]] = []
+    for r in range(2, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        if all(v in (None, "") for v in vals):
+            continue
+        obj = {"_row": r}
+        for i, h in enumerate(headers):
+            key = h or f"col_{i+1}"
+            obj[key] = vals[i]
+        rows.append(obj)
+    return {
+        "source_id": source_id,
+        "sheet_name": ws.title,
+        "path": str(p),
+        "headers": [h or f"col_{i+1}" for i, h in enumerate(headers)],
+        "rows": rows,
+    }
+
+
+def _validate_rule_rows(sheet_name: str, headers: List[str], rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    issues: List[Dict[str, Any]] = []
+    hset = {str(h) for h in headers}
+    text_keys = [h for h in headers if "text" in h.lower() or "template" in h.lower()]
+    threshold_keys = [
+        h
+        for h in headers
+        if h.lower() in {"threshold_value", "stable_threshold"}
+        or h.lower().endswith("_threshold")
+        or h.lower().endswith("_threshold_pp")
+    ]
+    place_key = next((h for h in headers if h.lower() in {"placeholders", "variables"}), "")
+    for i, row in enumerate(rows, start=1):
+        for tk in text_keys:
+            v = row.get(tk)
+            if isinstance(v, str) and ("?" in v or "�" in v):
+                issues.append({"row": i, "field": tk, "level": "error", "message": "疑似乱码字符"})
+        for nk in threshold_keys:
+            v = row.get(nk)
+            if v in (None, ""):
+                continue
+            try:
+                float(str(v).strip())
+            except Exception:
+                issues.append({"row": i, "field": nk, "level": "error", "message": "阈值应为数值"})
+        if place_key and ("template_text" in hset or "template_text_zh" in hset):
+            tpl = str(row.get("template_text", "") or row.get("template_text_zh", "") or "")
+            ph_raw = str(row.get(place_key, "") or "")
+            used = sorted(set(re.findall(r"\{([A-Za-z0-9_]+)\}", tpl)))
+            declared = sorted(set([x.strip().strip("{}") for x in ph_raw.replace(";", ",").split(",") if x.strip()]))
+            if used and declared:
+                miss = [x for x in used if x not in declared]
+                if miss:
+                    issues.append({"row": i, "field": place_key, "level": "warn", "message": f"占位符未声明: {','.join(miss)}"})
+    return issues
+
+
+def _save_rule_sheet(source_id: str, sheet_name: str, headers: List[str], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    src = _get_rule_source(source_id)
+    if not src:
+        raise ValueError("unknown source_id")
+    p = Path(src["path"])
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    wb = load_workbook(p, data_only=False)
+    ws = get_sheet_by_loose_name(wb, [sheet_name])
+    if ws is None:
+        raise ValueError(f"sheet not found: {sheet_name}")
+    issues = _validate_rule_rows(sheet_name, headers, rows)
+    has_error = any(x.get("level") == "error" for x in issues)
+    if has_error:
+        return {"ok": False, "issues": issues, "saved_rows": 0, "path": str(p), "sheet_name": ws.title}
+
+    # Rewrite body rows while preserving header row.
+    body_start = 2
+    max_cols = len(headers)
+    if ws.max_row >= body_start:
+        ws.delete_rows(body_start, ws.max_row - body_start + 1)
+    for r in rows:
+        vals = [r.get(h, None) for h in headers]
+        ws.append(vals)
+    # Ensure header row is stable by provided headers.
+    for c, h in enumerate(headers, start=1):
+        ws.cell(1, c).value = h
+    wb.save(p)
+    return {"ok": True, "issues": issues, "saved_rows": len(rows), "path": str(p), "sheet_name": ws.title}
+
+
 def render_index() -> str:
     cards = "".join(
         f'<a class="card" href="/sheet/{g["id"]}"><h3>{g["label"]}</h3><p>进入查看与编辑</p></a>' for g in SHEET_GROUPS
@@ -1946,6 +2110,7 @@ def render_index() -> str:
         '<a class="card" href="/analysis/income"><h3>收入分析</h3><p>经常性/非经常性收益拆分</p></a>'
         '<a class="card" href="/analysis/ratios"><h3>财务指标分析</h3><p>指标趋势、判断与确认</p></a>'
         '<a class="card" href="/analysis/key-ratios"><h3>重要指标分析</h3><p>ROE与毛利率深度分析</p></a>'
+        '<a class="card" href="/rules"><h3>规则配置</h3><p>阈值与文本模板可视化维护</p></a>'
     )
     project_options = "".join(f'<option value="{p}">{p}</option>' for p in list_projects())
     return f"""<!doctype html>
@@ -2016,6 +2181,277 @@ document.getElementById('plist').addEventListener('change', () => {{
 }});
 document.getElementById('pid').addEventListener('input', rewriteLinks);
 rewriteLinks();
+</script>
+</body>
+</html>"""
+
+
+def render_rules_page() -> str:
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>规则配置</title>
+  <style>
+    :root { --bg:#f5f7fa; --card:#fff; --ink:#111827; --line:#d1d5db; --muted:#6b7280; --acc:#0f766e; --warn:#92400e; --err:#991b1b; }
+    body { margin:0; font-family: "Microsoft YaHei","PingFang SC",sans-serif; background:var(--bg); color:var(--ink); }
+    .top { position:sticky; top:0; background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .btn { border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 10px; text-decoration:none; color:inherit; cursor:pointer; }
+    .btn.primary { background:var(--acc); color:#fff; border-color:var(--acc); }
+    .wrap { padding:12px 16px 24px; display:grid; grid-template-columns:320px 1fr; gap:12px; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .panel h3 { margin:0; padding:10px 12px; border-bottom:1px solid var(--line); font-size:14px; background:#fafafa; }
+    .body { padding:10px 12px; }
+    .muted { color:var(--muted); font-size:12px; }
+    .issues { max-height:200px; overflow:auto; border:1px solid #fde68a; background:#fffbeb; border-radius:8px; padding:8px; font-size:12px; }
+    .issues .err { color:var(--err); }
+    .issues .warn { color:var(--warn); }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:8px; }
+    table { width:100%; min-width:980px; border-collapse:collapse; }
+    th, td { border-bottom:1px solid #eef2f7; padding:6px 8px; font-size:12px; text-align:left; vertical-align:top; }
+    th { position:sticky; top:0; background:#f9fafb; }
+    td input, td textarea { width:100%; box-sizing:border-box; border:1px solid #d1d5db; border-radius:6px; padding:4px 6px; font:inherit; }
+    td textarea { min-height:40px; resize:vertical; }
+    .row-actions { display:flex; gap:8px; margin-top:8px; }
+    .ok { color:#065f46; font-weight:600; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a class="btn" href="/">返回主页</a>
+    <strong>规则配置（V1）</strong>
+    <span class="muted" id="status">加载中...</span>
+    <button class="btn" onclick="reloadSheet()">刷新</button>
+    <button class="btn primary" onclick="saveSheet()">保存规则</button>
+  </div>
+  <div class="wrap">
+    <div class="panel">
+      <h3>规则集选择</h3>
+      <div class="body">
+        <div style="margin-bottom:8px;">
+          <label class="muted">规则文件</label><br/>
+          <select id="sourceSel" style="width:100%;padding:6px;"></select>
+        </div>
+        <div style="margin-bottom:8px;">
+          <label class="muted">Sheet</label><br/>
+          <select id="sheetSel" style="width:100%;padding:6px;"></select>
+        </div>
+        <div class="muted" id="sourcePath"></div>
+        <div class="row-actions">
+          <button class="btn" onclick="addRow()">新增一行</button>
+          <button class="btn" onclick="reloadSheet()">重新读取</button>
+        </div>
+      </div>
+      <h3>校验结果</h3>
+      <div class="body">
+        <div class="issues" id="issuesBox">暂无</div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3 id="tableTitle">规则内容</h3>
+      <div class="body">
+        <div class="table-wrap">
+          <table id="tbl"></table>
+        </div>
+      </div>
+    </div>
+  </div>
+<script>
+let catalog = [];
+let headers = [];
+let rows = [];
+let sourceId = '';
+let sheetName = '';
+const ZH_NAME_MAP = {
+  // 资产负债分析模板
+  'asset_abs': '资产绝对量描述',
+  'liability_abs': '负债绝对量描述',
+  'asset_total_struct': '资产总计结构描述',
+  'asset_subtotal_struct': '资产小计结构描述',
+  'asset_item_struct': '资产一般科目结构描述',
+  'liability_total_struct': '负债合计结构描述',
+  'liability_subtotal_struct': '负债小计结构描述',
+  'liability_item_struct': '负债一般科目结构描述',
+  'scale_phrase_up': '绝对量变化词-增加',
+  'scale_phrase_down': '绝对量变化词-减少',
+  'scale_phrase_stable': '绝对量变化词-稳定',
+  'struct_phrase_up': '结构变化词-上升',
+  'struct_phrase_down': '结构变化词-下降',
+  'struct_phrase_stable': '结构变化词-稳定',
+  // 收入利润模板
+  'income_segment_value': '收入分项金额描述',
+  'income_segment_share': '收入分项占比描述',
+  'gross_segment_value': '毛利分项金额描述',
+  'gross_segment_impact': '毛利分项贡献描述',
+  // 常规指标模板
+  'indicator_value': '指标数值描述',
+  'indicator_trend': '指标趋势描述',
+  // 重点指标模板
+  'roe_headline': 'ROE总述',
+  'roe_single_driver': 'ROE单驱动判断',
+  'roe_dual_driver': 'ROE双驱动判断',
+  'roe_multi_driver': 'ROE多驱动判断',
+  'roe_offset': 'ROE对冲项判断',
+  'roe_l2_bridge': 'ROE二级驱动衔接',
+  'gm_headline': '毛利率总述',
+  'gm_single_driver': '毛利率单驱动判断',
+  'gm_dual_driver': '毛利率双驱动判断',
+  'gm_multi_driver': '毛利率多驱动判断',
+  'gm_structure_effect': '毛利率效应分解',
+  'gm_negative_profit_case': '毛利率负值场景说明',
+  'key_roe_factors': 'ROE三因子明细',
+  'key_gm_top_segments': '毛利分项摘要',
+  'sheet_auto_no_latest': '通用自动描述-缺最新值',
+  'sheet_auto_one_year': '通用自动描述-单年',
+  'sheet_auto_prev_missing': '通用自动描述-前值缺失',
+  'sheet_auto_two_year': '通用自动描述-双年变化',
+  // 阈值键
+  'significant_abs_contrib': '显著贡献阈值',
+  'single_driver_share': '单驱动占比阈值',
+  'dual_driver_share_sum': '双驱动合计阈值',
+  'dual_driver_each_min': '双驱动单项最小占比',
+  'delta_stable_pp': '稳定变动阈值(百分点)',
+  // 常见 scene
+  'summary': '总述',
+  'single_driver': '单驱动',
+  'dual_driver': '双驱动',
+  'multi_driver': '多驱动',
+  'offset': '对冲项',
+  'secondary_bridge': '二级驱动衔接',
+  'structure_effect': '效应分解',
+  'negative_case': '负值场景'
+};
+
+function esc(s){ return (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function setStatus(t){ document.getElementById('status').textContent = t || ''; }
+function currentSource(){ return catalog.find(x => x.source_id === sourceId) || null; }
+function keyField(){
+  const candidates = ['template_key','template_id','scene','threshold_key','metric_id','key'];
+  return candidates.find(k => headers.includes(k)) || '';
+}
+function displayHeaders(){
+  const out = [...headers];
+  const kf = keyField();
+  if (!kf) return out;
+  const idx = out.indexOf(kf);
+  if (idx < 0) return out;
+  out.splice(idx + 1, 0, '__zh_name');
+  return out;
+}
+function zhNameForRow(row){
+  const kf = keyField();
+  const keyVal = (row && kf) ? String(row[kf] ?? '').trim() : '';
+  if (keyVal && ZH_NAME_MAP[keyVal]) return ZH_NAME_MAP[keyVal];
+  // fallback: notes/description 可作为辅助中文说明
+  const note = String((row?.notes ?? row?.description ?? '') || '').trim();
+  return note || '';
+}
+function renderIssues(issues){
+  const box = document.getElementById('issuesBox');
+  if (!issues || !issues.length){ box.innerHTML = '暂无'; return; }
+  box.innerHTML = issues.map(x => `<div class="${x.level==='error'?'err':'warn'}">[${esc(x.level)}] 第${esc(x.row)}行 ${esc(x.field)}：${esc(x.message)}</div>`).join('');
+}
+function asInput(k, v){
+  const t = (v ?? '').toString();
+  const isLong = /text|template|notes|description/i.test(k) || t.length > 60;
+  if (isLong) return `<textarea data-key="${esc(k)}">${esc(t)}</textarea>`;
+  return `<input data-key="${esc(k)}" value="${esc(t)}"/>`;
+}
+function renderTable(){
+  const title = `${sourceId} / ${sheetName}`;
+  document.getElementById('tableTitle').textContent = title;
+  const dHeaders = displayHeaders();
+  const th = `<tr>${dHeaders.map(h => `<th>${esc(h === '__zh_name' ? '中文名称' : h)}</th>`).join('')}</tr>`;
+  const trs = rows.map((r, i) => {
+    const tds = dHeaders.map(h => {
+      if (h === '__zh_name') return `<td class="muted">${esc(zhNameForRow(r))}</td>`;
+      return `<td>${asInput(h, r[h])}</td>`;
+    }).join('');
+    return `<tr data-row="${i}">${tds}</tr>`;
+  }).join('');
+  document.getElementById('tbl').innerHTML = th + trs;
+}
+function collectRows(){
+  const out = [];
+  document.querySelectorAll('#tbl tr[data-row]').forEach(tr => {
+    const row = {};
+    tr.querySelectorAll('[data-key]').forEach(el => {
+      const k = el.getAttribute('data-key');
+      row[k] = (el.value ?? '').toString();
+    });
+    out.push(row);
+  });
+  return out;
+}
+function renderSourceSheetOptions(){
+  const srcSel = document.getElementById('sourceSel');
+  srcSel.innerHTML = catalog.map(x => `<option value="${esc(x.source_id)}">${esc(x.label)}${x.exists?'':' (文件不存在)'}</option>`).join('');
+  if (!sourceId && catalog.length) sourceId = catalog[0].source_id;
+  srcSel.value = sourceId;
+  const src = currentSource();
+  const sheetSel = document.getElementById('sheetSel');
+  const sheets = src ? (src.sheets || []) : [];
+  sheetSel.innerHTML = sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  if (!sheetName && sheets.length) sheetName = sheets[0];
+  sheetSel.value = sheetName;
+  document.getElementById('sourcePath').textContent = src ? (`${src.path}`) : '';
+}
+async function loadCatalog(){
+  const res = await fetch('/api/rules/catalog');
+  const data = await res.json();
+  catalog = data.sources || [];
+  renderSourceSheetOptions();
+}
+async function reloadSheet(){
+  if (!sourceId || !sheetName) return;
+  setStatus('读取中...');
+  const u = `/api/rules?source_id=${encodeURIComponent(sourceId)}&sheet=${encodeURIComponent(sheetName)}`;
+  const res = await fetch(u);
+  const data = await res.json();
+  if (!res.ok){ setStatus(data.error || '读取失败'); return; }
+  headers = data.headers || [];
+  rows = data.rows || [];
+  renderTable();
+  renderIssues([]);
+  setStatus(`已加载 ${rows.length} 行`);
+}
+function addRow(){
+  if (!headers.length) return;
+  const r = {};
+  headers.forEach(h => r[h] = '');
+  rows.push(r);
+  renderTable();
+}
+async function saveSheet(){
+  if (!sourceId || !sheetName) return;
+  const payload = { source_id: sourceId, sheet_name: sheetName, headers, rows: collectRows() };
+  setStatus('保存中...');
+  const res = await fetch('/api/rules/save', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  renderIssues(data.issues || []);
+  if (!res.ok || !data.ok){
+    setStatus(data.error || '保存失败');
+    return;
+  }
+  setStatus(`保存成功：${data.saved_rows} 行`);
+  await reloadSheet();
+}
+document.getElementById('sourceSel').addEventListener('change', async (e) => {
+  sourceId = e.target.value;
+  sheetName = '';
+  renderSourceSheetOptions();
+  await reloadSheet();
+});
+document.getElementById('sheetSel').addEventListener('change', async (e) => {
+  sheetName = e.target.value;
+  await reloadSheet();
+});
+(async () => { await loadCatalog(); await reloadSheet(); })();
 </script>
 </body>
 </html>"""
@@ -2104,15 +2540,33 @@ function numericCell(v) {{
   return `<td>${{esc(v)}}</td>`;
 }}
 
+function normalizeNarrativeText(s) {{
+  let t = (s ?? '').toString();
+  if (!t) return t;
+  // Normalize legacy punctuation artifacts from old generated sheets.
+  t = t.replaceAll('：，', '，').replaceAll(':,', '，');
+  // Also normalize accidental duplicated punctuation.
+  t = t.replaceAll('，，', '，').replaceAll('：:', '：');
+  return t;
+}}
+
+function normalizeSubjectName(s) {{
+  return (s ?? '').toString().replace(/[：:]+$/,'').trim();
+}}
+
 function renderRowTable(elId, rowObj) {{
   const el = document.getElementById(elId);
   if (!rowObj) {{
     el.innerHTML = '<tr><td>未找到该科目数据</td></tr>';
     return;
   }}
-  const keys = Object.keys(rowObj);
+  const row = {{...rowObj}};
+  if (Object.prototype.hasOwnProperty.call(row, '科目名称')) {{
+    row['科目名称'] = normalizeSubjectName(row['科目名称']);
+  }}
+  const keys = Object.keys(row);
   const head = `<tr>${{keys.map(k => `<th>${{esc(k)}}</th>`).join('')}}</tr>`;
-  const body = `<tr>${{keys.map(k => numericCell(rowObj[k])).join('')}}</tr>`;
+  const body = `<tr>${{keys.map(k => numericCell(row[k])).join('')}}</tr>`;
   el.innerHTML = head + body;
 }}
 
@@ -2120,7 +2574,7 @@ function renderSubjectList() {{
   const rows = cache.scale.rows || [];
   const html = rows.map(r => {{
     const c = String(r['科目编码'] || '');
-    const n = String(r['科目名称'] || '');
+    const n = String(r['科目名称'] || '').replace(/[：:]+$/,'').trim();
     const active = c === activeCode ? 'active' : '';
     return `<div class="item ${{active}}" data-code="${{esc(c)}}"><strong>${{esc(c)}}</strong> ${{esc(n)}}</div>`;
   }}).join('');
@@ -2140,8 +2594,8 @@ function renderAll() {{
   const structRow = rowByCode(cache.structure.rows, activeCode);
   const analysisRow = rowByCode(cache.analysis.rows, activeCode) || {{}};
   renderRowTable('scaleTbl', scaleRow);
-  document.getElementById('scaleDesc').textContent = scaleRow?.['定量描述_绝对量'] || '';
-  document.getElementById('structDesc').textContent = structRow?.['定量描述_相对量'] || '';
+  document.getElementById('scaleDesc').textContent = normalizeNarrativeText(scaleRow?.['定量描述_绝对量'] || '');
+  document.getElementById('structDesc').textContent = normalizeNarrativeText(structRow?.['定量描述_相对量'] || '');
   document.getElementById('manualText').value = analysisRow['manual_text'] || analysisRow['auto_combined'] || '';
   document.getElementById('manualConfirmed').checked = !!analysisRow['confirmed'];
   document.getElementById('saveHint').textContent = analysisRow['confirmed'] ? '当前已确认' : '';
@@ -2900,6 +3354,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_html(render_key_ratio_analysis_page(self._project_id(qs)))
             return
 
+        if path == "/rules":
+            self._send_html(render_rules_page())
+            return
+
         if path.startswith("/api/sheet/"):
             group_id = unquote(path.split("/")[-1]).strip()
             project_id = self._project_id(qs)
@@ -3064,6 +3522,25 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_xlsx(body, f"{project_id}_收入结构分析计算表.xlsx")
             return
 
+        if path == "/api/rules/catalog":
+            self._send_json({"sources": _rule_catalog()})
+            return
+
+        if path == "/api/rules":
+            source_id = str((qs.get("source_id") or [""])[0]).strip()
+            sheet_name = str((qs.get("sheet") or [""])[0]).strip()
+            if not source_id or not sheet_name:
+                self._send_json({"error": "missing source_id or sheet"}, status=400)
+                return
+            try:
+                data = _read_rule_sheet(source_id, sheet_name)
+                self._send_json(data)
+            except FileNotFoundError as e:
+                self._send_json({"error": f"rule file not found: {e}"}, status=404)
+            except Exception as e:  # noqa: BLE001
+                self._send_json({"error": str(e)}, status=400)
+            return
+
         if path == "/api/projects":
             self._send_json({"projects": list_projects()})
             return
@@ -3072,7 +3549,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != "/api/save":
+        if parsed.path not in {"/api/save", "/api/rules/save"}:
             self._send_json({"error": "not found"}, status=404)
             return
 
@@ -3082,6 +3559,26 @@ class AppHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except Exception:
             self._send_json({"ok": False, "error": "invalid payload"}, status=400)
+            return
+
+        if parsed.path == "/api/rules/save":
+            source_id = str(body.get("source_id", "")).strip()
+            sheet_name = str(body.get("sheet_name", "")).strip()
+            headers = body.get("headers", [])
+            rows = body.get("rows", [])
+            if not source_id or not sheet_name or not isinstance(headers, list) or not isinstance(rows, list):
+                self._send_json({"ok": False, "error": "missing source_id/sheet_name/headers/rows"}, status=400)
+                return
+            try:
+                result = _save_rule_sheet(source_id, sheet_name, [str(x) for x in headers], rows)
+                if not result.get("ok"):
+                    self._send_json(result, status=400)
+                    return
+                self._send_json(result)
+            except FileNotFoundError as e:
+                self._send_json({"ok": False, "error": f"rule file not found: {e}"}, status=404)
+            except Exception as e:  # noqa: BLE001
+                self._send_json({"ok": False, "error": str(e)}, status=400)
             return
 
         project_id = normalize_project_id(str(body.get("project_id", DEFAULT_PROJECT_ID)))
