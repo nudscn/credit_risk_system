@@ -38,6 +38,27 @@ LIABILITY_ANALYSIS_SHEETS = {
     "scale": ["分析_规模变化_负债类"],
     "structure": ["分析_结构占比_负债类"],
 }
+SUMMARY_ANALYSIS_ITEMS = [
+    {"code": "SUM001", "name": "流动资产", "kind": "bs", "source_code": "BS000", "code_candidates": ["BS000", "BS027"]},
+    {"code": "SUM002", "name": "非流动资产", "kind": "bs", "source_code": "BS028", "code_candidates": ["BS028", "BS056"]},
+    {"code": "SUM003", "name": "资产总计", "kind": "bs", "source_code": "BS057", "code_candidates": ["BS057"]},
+    {"code": "SUM004", "name": "流动负债", "kind": "bs", "source_code": "BS058", "code_candidates": ["BS058", "BS089"]},
+    {"code": "SUM005", "name": "非流动负债", "kind": "bs", "source_code": "BS090", "code_candidates": ["BS090", "BS102"]},
+    {"code": "SUM006", "name": "负债总计", "kind": "bs", "source_code": "BS103", "code_candidates": ["BS103"]},
+    {"code": "SUM007", "name": "营业收入", "kind": "is", "source_code": "IS001", "code_candidates": ["IS001"], "name_keywords": ["营业总收入", "营业收入"]},
+    {"code": "SUM008", "name": "经营净收益", "kind": "income_combo", "source_code": "3.1+3.2"},
+    {"code": "SUM009", "name": "主营业务毛利收益", "kind": "income_node", "source_code": "2.1.1"},
+    {"code": "SUM010", "name": "经常性净收益", "kind": "income_node", "source_code": "3.1"},
+    {"code": "SUM011", "name": "非经常性净收益", "kind": "income_node", "source_code": "3.2"},
+]
+SUMMARY_TOP_COVERAGE_TARGET_PCT = 75.0
+SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME = 90.0
+SUMMARY_EXCLUDE_CODES = {
+    "SUM001": {"BS004", "BS009", "BS015"},  # 流动资产：排除不同层级科目
+    "SUM002": {"BS041", "BS044"},  # 非流动资产：排除不同层级科目
+    "SUM004": {"BS062", "BS070"},  # 流动负债：排除不同层级科目
+    "SUM005": {"BS094"},  # 非流动负债：排除不同层级科目
+}
 ANALYSIS_CODE_REDIRECTS = {
     "asset_analysis": {
         "BS028": "BS056",  # 非流动资产 <- 非流动资产合计
@@ -52,12 +73,13 @@ INCOME_RULEBOOK_PATH = PROJECT_ROOT / "config" / "income_profit_rulebook_skeleto
 INCOME_RULEBOOK_FALLBACK_PATH = PROJECT_ROOT / "config" / "rulebook.xlsx"
 RATIO_RULEBOOK_PATH = PROJECT_ROOT / "config" / "ratio_analysis_rulebook.xlsx"
 KEY_RATIO_RULEBOOK_PATH = PROJECT_ROOT / "config" / "key_ratio_rulebook.xlsx"
+VALIDATION_RULEBOOK_PATH = PROJECT_ROOT / "config" / "validation_rulebook.xlsx"
 RULE_EDIT_SOURCES = [
     {
         "source_id": "rulebook_main",
         "label": "资产负债分析规则（rulebook.xlsx）",
         "path": PROJECT_ROOT / "config" / "rulebook.xlsx",
-        "sheets": ["analysis_text_templates"],
+        "sheets": ["analysis_text_templates", "analysis_thresholds"],
     },
     {
         "source_id": "ratio_rulebook",
@@ -69,7 +91,7 @@ RULE_EDIT_SOURCES = [
         "source_id": "income_rulebook",
         "label": "收入利润规则（income_profit_rulebook_skeleton.xlsx）",
         "path": PROJECT_ROOT / "config" / "income_profit_rulebook_skeleton.xlsx",
-        "sheets": ["text_templates", "trend_thresholds"],
+        "sheets": ["text_templates", "trend_thresholds", "sign_scenario_policy", "contribution_policy"],
     },
     {
         "source_id": "key_ratio_rulebook",
@@ -77,7 +99,335 @@ RULE_EDIT_SOURCES = [
         "path": PROJECT_ROOT / "config" / "key_ratio_rulebook.xlsx",
         "sheets": ["narrative_templates", "driver_thresholds"],
     },
+    {
+        "source_id": "validation_rulebook",
+        "label": "报表校验规则（validation_rulebook.xlsx）",
+        "path": PROJECT_ROOT / "config" / "validation_rulebook.xlsx",
+        "sheets": ["bs_checks", "is_checks", "cf_checks"],
+    },
 ]
+
+
+def _detect_template_workbook_path() -> Optional[Path]:
+    cfg_dir = PROJECT_ROOT / "config"
+    ignore = {
+        "rulebook.xlsx",
+        "ratio_analysis_rulebook.xlsx",
+        "income_profit_rulebook_skeleton.xlsx",
+        "key_ratio_rulebook.xlsx",
+        "validation_rulebook.xlsx",
+    }
+    candidates: List[tuple] = []
+    for p in cfg_dir.glob("*.xlsx"):
+        if p.name.lower() in ignore:
+            continue
+        try:
+            wb = load_workbook(p, data_only=True, read_only=True)
+            score = len(wb.sheetnames)
+            wb.close()
+            candidates.append((score, p))
+        except Exception:
+            continue
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
+
+
+def _load_bs_code_name_catalog() -> List[Dict[str, str]]:
+    tpl = _detect_template_workbook_path()
+    if tpl is None:
+        return []
+    try:
+        wb = load_workbook(tpl, data_only=True, read_only=True)
+    except Exception:
+        return []
+    ws_bs = None
+    for ws in wb.worksheets:
+        hit = 0
+        for r in range(2, min(ws.max_row, 220) + 1):
+            v = str(ws.cell(r, 1).value or "").strip()
+            if re.match(r"^BS\d{3}$", v):
+                hit += 1
+        if hit >= 20:
+            ws_bs = ws
+            break
+    out: List[Dict[str, str]] = []
+    if ws_bs is None:
+        wb.close()
+        return out
+    for r in range(2, ws_bs.max_row + 1):
+        code = str(ws_bs.cell(r, 1).value or "").strip()
+        name = str(ws_bs.cell(r, 2).value or "").strip().rstrip("：:").strip()
+        if re.match(r"^BS\d{3}$", code):
+            out.append({"code": code, "name": name})
+    wb.close()
+    out.sort(key=lambda x: x["code"])
+    return out
+
+
+def _read_threshold_config() -> Dict[str, Any]:
+    p = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    global_scale_pct = 2.0
+    global_struct_pp = 2.0
+    summary_top_coverage_default = float(SUMMARY_TOP_COVERAGE_TARGET_PCT)
+    summary_top_coverage_income = float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME)
+    subject_scale_map: Dict[str, float] = {}
+    subject_struct_map: Dict[str, float] = {}
+    if not p.exists():
+        return {
+            "global_scale_pct": global_scale_pct,
+            "global_struct_pp": global_struct_pp,
+            "summary_top_coverage_default": summary_top_coverage_default,
+            "summary_top_coverage_income": summary_top_coverage_income,
+            "subject_scale_pct": subject_scale_map,
+            "subject_struct_pp": subject_struct_map,
+            # backward-compatible aliases
+            "global_pct": global_scale_pct,
+            "subject_pct": subject_scale_map,
+        }
+    try:
+        wb = load_workbook(p, data_only=True)
+    except Exception:
+        return {
+            "global_scale_pct": global_scale_pct,
+            "global_struct_pp": global_struct_pp,
+            "summary_top_coverage_default": summary_top_coverage_default,
+            "summary_top_coverage_income": summary_top_coverage_income,
+            "subject_scale_pct": subject_scale_map,
+            "subject_struct_pp": subject_struct_map,
+            "global_pct": global_scale_pct,
+            "subject_pct": subject_scale_map,
+        }
+    ws = get_sheet_by_loose_name(wb, ["analysis_thresholds", "分析阈值配置"])
+    if ws is None:
+        return {
+            "global_scale_pct": global_scale_pct,
+            "global_struct_pp": global_struct_pp,
+            "summary_top_coverage_default": summary_top_coverage_default,
+            "summary_top_coverage_income": summary_top_coverage_income,
+            "subject_scale_pct": subject_scale_map,
+            "subject_struct_pp": subject_struct_map,
+            "global_pct": global_scale_pct,
+            "subject_pct": subject_scale_map,
+        }
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_scope = headers.get("scope", 1)
+    c_subj = headers.get("subject_code", 2)
+    c_scale = headers.get("scale_stable_pct", headers.get("stable_threshold_pct", 3))
+    c_struct = headers.get("struct_stable_pp", c_scale)
+    c_enabled = headers.get("enabled", 4)
+    for r in range(2, ws.max_row + 1):
+        enabled_raw = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled_raw in {"0", "false", "no"}:
+            continue
+        scope = str(ws.cell(r, c_scope).value or "").strip().lower()
+        subj = str(ws.cell(r, c_subj).value or "").strip().upper()
+        try:
+            v_scale = float(ws.cell(r, c_scale).value)
+        except Exception:
+            continue
+        try:
+            v_struct = float(ws.cell(r, c_struct).value)
+        except Exception:
+            v_struct = v_scale
+        if scope in {"global", "全局"}:
+            global_scale_pct = v_scale
+            global_struct_pp = v_struct
+        elif scope in {"summary", "汇总"}:
+            # Reuse scale_stable_pct column as summary-top coverage threshold.
+            if subj in {"SUM_ALL", "SUMMARY_DEFAULT"}:
+                summary_top_coverage_default = v_scale
+            elif subj in {"SUM007", "INCOME"}:
+                summary_top_coverage_income = v_scale
+        elif scope in {"subject", "科目"} and re.match(r"^BS\d{3}$", subj):
+            subject_scale_map[subj] = v_scale
+            subject_struct_map[subj] = v_struct
+    return {
+        "global_scale_pct": global_scale_pct,
+        "global_struct_pp": global_struct_pp,
+        "summary_top_coverage_default": summary_top_coverage_default,
+        "summary_top_coverage_income": summary_top_coverage_income,
+        "subject_scale_pct": subject_scale_map,
+        "subject_struct_pp": subject_struct_map,
+        "global_pct": global_scale_pct,
+        "subject_pct": subject_scale_map,
+    }
+
+
+def _save_threshold_config(
+    global_scale_pct: float,
+    global_struct_pp: float,
+    subject_rows: List[Dict[str, Any]],
+    summary_top_coverage_default: float = SUMMARY_TOP_COVERAGE_TARGET_PCT,
+    summary_top_coverage_income: float = SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME,
+) -> Dict[str, Any]:
+    p = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    if not p.exists():
+        return {"ok": False, "error": f"rulebook not found: {p}"}
+    try:
+        wb = load_workbook(p, data_only=False)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+    ws = get_sheet_by_loose_name(wb, ["analysis_thresholds", "分析阈值配置"])
+    if ws is None:
+        ws = wb.create_sheet("analysis_thresholds")
+    headers = ["scope", "subject_code", "scale_stable_pct", "struct_stable_pp", "enabled", "notes"]
+    # reset sheet
+    if ws.max_row > 0:
+        ws.delete_rows(1, ws.max_row)
+    ws.append(headers)
+    ws.append(["global", "", float(global_scale_pct), float(global_struct_pp), 1, "全局默认阈值"])
+    ws.append(["summary", "SUM_ALL", float(summary_top_coverage_default), float(summary_top_coverage_default), 1, "分析汇总Top构成覆盖阈值(默认)"])
+    ws.append(["summary", "SUM007", float(summary_top_coverage_income), float(summary_top_coverage_income), 1, "分析汇总Top构成覆盖阈值(营业收入)"])
+    saved_subject = 0
+    for r in subject_rows:
+        code = str(r.get("code", "")).strip().upper()
+        enabled = bool(r.get("enabled", False))
+        if not enabled:
+            continue
+        if not re.match(r"^BS\d{3}$", code):
+            continue
+        try:
+            v_scale = float(r.get("scale_threshold_pct", r.get("threshold_pct")))
+        except Exception:
+            continue
+        try:
+            v_struct = float(r.get("struct_threshold_pp", v_scale))
+        except Exception:
+            v_struct = v_scale
+        name = str(r.get("name", "")).strip()
+        ws.append(["subject", code, v_scale, v_struct, 1, name])
+        saved_subject += 1
+    wb.save(p)
+    return {
+        "ok": True,
+        "global_scale_pct": float(global_scale_pct),
+        "global_struct_pp": float(global_struct_pp),
+        "summary_top_coverage_default": float(summary_top_coverage_default),
+        "summary_top_coverage_income": float(summary_top_coverage_income),
+        "saved_subject_rows": saved_subject,
+        "path": str(p),
+        "sheet": ws.title,
+    }
+
+
+def _read_analysis_thresholds_expanded(source_id: str, sheet_name: str) -> Dict[str, Any]:
+    cfg = _read_threshold_config()
+    catalog = _load_bs_code_name_catalog()
+    subj_scale = cfg.get("subject_scale_pct", {}) if isinstance(cfg.get("subject_scale_pct"), dict) else {}
+    subj_struct = cfg.get("subject_struct_pp", {}) if isinstance(cfg.get("subject_struct_pp"), dict) else {}
+    headers = ["scope", "subject_code", "subject_name", "scale_stable_pct", "struct_stable_pp", "enabled", "notes"]
+    rows: List[Dict[str, Any]] = []
+    rows.append(
+        {
+            "_row": 2,
+            "scope": "global",
+            "subject_code": "",
+            "subject_name": "全局默认",
+            "scale_stable_pct": cfg.get("global_scale_pct", cfg.get("global_pct", 2.0)),
+            "struct_stable_pp": cfg.get("global_struct_pp", cfg.get("global_pct", 2.0)),
+            "enabled": 1,
+            "notes": "全局默认阈值",
+        }
+    )
+    rows.append(
+        {
+            "_row": 3,
+            "scope": "summary",
+            "subject_code": "SUM_ALL",
+            "subject_name": "分析汇总Top构成覆盖阈值(默认)",
+            "scale_stable_pct": cfg.get("summary_top_coverage_default", float(SUMMARY_TOP_COVERAGE_TARGET_PCT)),
+            "struct_stable_pp": cfg.get("summary_top_coverage_default", float(SUMMARY_TOP_COVERAGE_TARGET_PCT)),
+            "enabled": 1,
+            "notes": "用于分析汇总页除营业收入外的Top构成披露阈值(%)",
+        }
+    )
+    rows.append(
+        {
+            "_row": 4,
+            "scope": "summary",
+            "subject_code": "SUM007",
+            "subject_name": "分析汇总Top构成覆盖阈值(营业收入)",
+            "scale_stable_pct": cfg.get("summary_top_coverage_income", float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME)),
+            "struct_stable_pp": cfg.get("summary_top_coverage_income", float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME)),
+            "enabled": 1,
+            "notes": "用于分析汇总页营业收入Top构成披露阈值(%)",
+        }
+    )
+    rid = 5
+    for x in catalog:
+        code = str(x.get("code", "")).strip().upper()
+        if not re.match(r"^BS\d{3}$", code):
+            continue
+        name = str(x.get("name", "")).strip()
+        rows.append(
+            {
+                "_row": rid,
+                "scope": "subject",
+                "subject_code": code,
+                "subject_name": name,
+                "scale_stable_pct": subj_scale.get(code, cfg.get("global_scale_pct", cfg.get("global_pct", 2.0))),
+                "struct_stable_pp": subj_struct.get(code, cfg.get("global_struct_pp", cfg.get("global_pct", 2.0))),
+                "enabled": 1 if code in subj_scale or code in subj_struct else 0,
+                "notes": name,
+            }
+        )
+        rid += 1
+    return {
+        "source_id": source_id,
+        "sheet_name": sheet_name,
+        "path": str(PROJECT_ROOT / "config" / "rulebook.xlsx"),
+        "headers": headers,
+        "rows": rows,
+    }
+
+
+def _save_analysis_thresholds_expanded(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    global_scale_pct = 2.0
+    global_struct_pp = 2.0
+    summary_top_coverage_default = float(SUMMARY_TOP_COVERAGE_TARGET_PCT)
+    summary_top_coverage_income = float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME)
+    subject_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        scope = str(row.get("scope", "")).strip().lower()
+        code = str(row.get("subject_code", "")).strip().upper()
+        enabled_raw = str(row.get("enabled", "")).strip().lower()
+        enabled = enabled_raw in {"1", "true", "yes", "y", "on"}
+        try:
+            scale_v = float(row.get("scale_stable_pct", row.get("stable_threshold_pct")))
+        except Exception:
+            continue
+        try:
+            struct_v = float(row.get("struct_stable_pp", scale_v))
+        except Exception:
+            struct_v = scale_v
+        if scope in {"global", "全局"}:
+            global_scale_pct = scale_v
+            global_struct_pp = struct_v
+            continue
+        if scope in {"summary", "汇总"}:
+            if code in {"SUM_ALL", "SUMMARY_DEFAULT"}:
+                summary_top_coverage_default = scale_v
+            elif code in {"SUM007", "INCOME"}:
+                summary_top_coverage_income = scale_v
+            continue
+        if scope in {"subject", "科目"} and re.match(r"^BS\d{3}$", code):
+            subject_rows.append(
+                {
+                    "code": code,
+                    "name": str(row.get("subject_name", "")).strip() or str(row.get("notes", "")).strip(),
+                    "enabled": enabled,
+                    "scale_threshold_pct": scale_v,
+                    "struct_threshold_pp": struct_v,
+                }
+            )
+    return _save_threshold_config(
+        global_scale_pct=global_scale_pct,
+        global_struct_pp=global_struct_pp,
+        subject_rows=subject_rows,
+        summary_top_coverage_default=summary_top_coverage_default,
+        summary_top_coverage_income=summary_top_coverage_income,
+    )
 DEFAULT_INCOME_SPECIAL_ITEMS = [
     {"node_id": "2.1.2.1", "label": "其他收益（政府补助等）", "code_candidates": [], "name_keywords": ["其他收益"]},
     {"node_id": "2.1.2.2", "label": "信用减值损失", "code_candidates": [], "name_keywords": ["信用减值损失"]},
@@ -151,6 +501,17 @@ DEFAULT_TEXT_TEMPLATES = {
     "sheet_auto_two_year": "{name}：{latest}年为{latest_val}，较{prev}年{direction}{abs_diff}（{abs_pct}%）。",
     "income_segment_value": "{label}：{y1}年{v1}万元，{y2}年{v2}万元，{y3}年{v3}万元；{y2}较{y1}{t21}，{y3}较{y2}{t32}。",
     "income_segment_share": "{ratio_label}：{y1}年{r1}，{y2}年{r2}，{y3}年{r3}；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+    "gross_contribution_basis": "口径说明：{y1}年{b1}，{y2}年{b2}，{y3}年{b3}。",
+    "gross_segment_net_attr": "净归因占比：{y1}年{n1}，{y2}年{n2}，{y3}年{n3}；{y2}较{y1}{nt21}，{y3}较{y2}{nt32}。",
+    "gross_segment_dual_view": "{strength_label}：{s_latest}；{net_label}：{n_latest}。",
+    "gross_segment_scenario_judgement": "场景定性（{latest_year}）：{qual_word}（{scenario}）。",
+    "profit_summary_header_missing": "{title}（{latest_year}）：总额待补充。",
+    "profit_summary_header_positive": "{title}（{latest_year}）：总额{total_amount}万元。",
+    "profit_summary_header_zero": "{title}（{latest_year}）：总额为0（各分项正负对冲）。",
+    "profit_summary_header_negative": "{title}（{latest_year}）：总额亏损{total_abs_amount}万元。",
+    "profit_summary_line_positive": "{name}：贡献{amount}万元，{net_attr_label}{net_attr_pct}；{direction_word}。",
+    "profit_summary_line_negative": "{name}：亏损{abs_amount}万元，{net_attr_label}{net_attr_pct}；{direction_word}。",
+    "profit_summary_line_zero": "{name}：影响中性，{net_attr_label}{net_attr_pct}。",
     "ratio_indicator_value": "{name}：{y1}年{v1}{unit}，{y2}年{v2}{unit}，{y3}年{v3}{unit}。",
     "ratio_indicator_trend": "{y2}较{y1}{judgement21}（变动{delta21}{unit2}）；{y3}较{y2}{judgement32}（变动{delta32}{unit2}）。",
     "key_roe_factors": "净利率：{y1}年{nm1}，{y2}年{nm2}，{y3}年{nm3}；总资产周转率：{y1}年{at1}，{y2}年{at2}，{y3}年{at3}；权益乘数：{y1}年{em1}，{y2}年{em2}，{y3}年{em3}。",
@@ -296,6 +657,19 @@ def load_income_rules() -> Dict[str, Any]:
     cfg = {
         "yoy_stable_pct": 2.0,
         "share_stable_pp": 2.0,
+        "trend_thresholds": {
+            "rev_yoy": {"stable": 2.0, "unit": "ratio", "up_label": "增加", "down_label": "减少", "stable_label": "保持稳定"},
+            "gp_value": {"stable": 2.0, "unit": "ratio", "up_label": "增加", "down_label": "减少", "stable_label": "保持稳定"},
+            "rev_share": {"stable": 2.0, "unit": "pct_point", "up_label": "上升", "down_label": "下降", "stable_label": "基本稳定"},
+            "gp_share_impact": {"stable": 2.0, "unit": "pct_point", "up_label": "上升", "down_label": "下降", "stable_label": "基本稳定"},
+        },
+        "contribution_policy": {
+            "gp_share_mode": "impact_when_mixed_or_total_negative",
+            "impact_ratio_label": "毛利贡献（驱动占比）",
+            "algebraic_ratio_label": "毛利贡献（占总毛利比例）",
+            "basis_impact_text": "按绝对值口径",
+            "basis_algebraic_text": "按代数口径",
+        },
         "special_items": list(DEFAULT_INCOME_SPECIAL_ITEMS),
         "recurring_keys": set(DEFAULT_RECURRING_KEYS),
         "nonrec_keys": set(DEFAULT_NONREC_KEYS),
@@ -304,7 +678,15 @@ def load_income_rules() -> Dict[str, Any]:
         "text_templates": {
             "income_segment_value": DEFAULT_TEXT_TEMPLATES["income_segment_value"],
             "income_segment_share": DEFAULT_TEXT_TEMPLATES["income_segment_share"],
+            "profit_summary_header_missing": DEFAULT_TEXT_TEMPLATES["profit_summary_header_missing"],
+            "profit_summary_header_positive": DEFAULT_TEXT_TEMPLATES["profit_summary_header_positive"],
+            "profit_summary_header_zero": DEFAULT_TEXT_TEMPLATES["profit_summary_header_zero"],
+            "profit_summary_header_negative": DEFAULT_TEXT_TEMPLATES["profit_summary_header_negative"],
+            "profit_summary_line_positive": DEFAULT_TEXT_TEMPLATES["profit_summary_line_positive"],
+            "profit_summary_line_negative": DEFAULT_TEXT_TEMPLATES["profit_summary_line_negative"],
+            "profit_summary_line_zero": DEFAULT_TEXT_TEMPLATES["profit_summary_line_zero"],
         },
+        "sign_policies": [],
     }
 
     candidate_paths = [INCOME_RULEBOOK_PATH, INCOME_RULEBOOK_FALLBACK_PATH]
@@ -322,10 +704,29 @@ def load_income_rules() -> Dict[str, Any]:
             c_metric = headers.get("metric_id", 2)
             c_stable = headers.get("stable_threshold", 3)
             c_unit = headers.get("threshold_unit", 4)
+            c_up = headers.get("up_label", 5)
+            c_down = headers.get("down_label", 6)
+            c_stable_label = headers.get("stable_label", 7)
             for r in range(2, ws_tr.max_row + 1):
                 metric = str(ws_tr.cell(r, c_metric).value or "").strip()
+                if not metric:
+                    continue
                 stable = _safe_float(ws_tr.cell(r, c_stable).value, 0.0)
                 unit = str(ws_tr.cell(r, c_unit).value or "").strip()
+                up_label = str(ws_tr.cell(r, c_up).value or "").strip() or cfg["trend_thresholds"].get(metric, {}).get("up_label", "")
+                down_label = str(ws_tr.cell(r, c_down).value or "").strip() or cfg["trend_thresholds"].get(metric, {}).get("down_label", "")
+                stable_label = (
+                    str(ws_tr.cell(r, c_stable_label).value or "").strip()
+                    or cfg["trend_thresholds"].get(metric, {}).get("stable_label", "")
+                )
+                stable_norm = _to_pct_threshold(stable, unit) if unit == "ratio" else stable
+                cfg["trend_thresholds"][metric] = {
+                    "stable": stable_norm,
+                    "unit": unit,
+                    "up_label": up_label,
+                    "down_label": down_label,
+                    "stable_label": stable_label,
+                }
                 if metric == "rev_yoy":
                     cfg["yoy_stable_pct"] = _to_pct_threshold(stable, unit)
                 elif metric in {"rev_share", "gp_share_impact"}:
@@ -377,6 +778,58 @@ def load_income_rules() -> Dict[str, Any]:
                 cfg["recurring_keys"] = rec
             if nonrec:
                 cfg["nonrec_keys"] = nonrec
+
+        ws_sign = get_sheet_by_loose_name(wb, ["sign_scenario_policy", "正负场景策略"])
+        if ws_sign is not None:
+            headers = {str(ws_sign.cell(1, c).value or "").strip(): c for c in range(1, ws_sign.max_column + 1)}
+            c_pid = headers.get("policy_id", 1)
+            c_scn = headers.get("scenario", 2)
+            c_cond = headers.get("condition_expr", 3)
+            c_metric = headers.get("primary_ratio_metric", 4)
+            c_pos = headers.get("direction_label_pos", 5)
+            c_neg = headers.get("direction_label_neg", 6)
+            c_pri = headers.get("display_priority", 7)
+            c_enabled = headers.get("enabled", 8)
+            policies = []
+            for r in range(2, ws_sign.max_row + 1):
+                enabled_raw = str(ws_sign.cell(r, c_enabled).value or "1").strip().lower()
+                if enabled_raw in {"0", "false", "no"}:
+                    continue
+                pid = str(ws_sign.cell(r, c_pid).value or "").strip()
+                if not pid:
+                    continue
+                policies.append(
+                    {
+                        "policy_id": pid,
+                        "scenario": str(ws_sign.cell(r, c_scn).value or "").strip(),
+                        "condition_expr": str(ws_sign.cell(r, c_cond).value or "").strip().lower(),
+                        "primary_ratio_metric": str(ws_sign.cell(r, c_metric).value or "").strip(),
+                        "direction_label_pos": str(ws_sign.cell(r, c_pos).value or "").strip(),
+                        "direction_label_neg": str(ws_sign.cell(r, c_neg).value or "").strip(),
+                        "display_priority": _safe_float(ws_sign.cell(r, c_pri).value, 9999),
+                    }
+                )
+            if policies:
+                policies.sort(key=lambda x: (x.get("display_priority", 9999), str(x.get("policy_id", ""))))
+                cfg["sign_policies"] = policies
+
+        ws_cp = get_sheet_by_loose_name(wb, ["contribution_policy", "贡献口径策略"])
+        if ws_cp is not None:
+            headers = {str(ws_cp.cell(1, c).value or "").strip(): c for c in range(1, ws_cp.max_column + 1)}
+            c_key = headers.get("key", 1)
+            c_val = headers.get("value", 2)
+            c_enabled = headers.get("enabled", 3)
+            cp = dict(cfg.get("contribution_policy", {}))
+            for r in range(2, ws_cp.max_row + 1):
+                enabled_raw = str(ws_cp.cell(r, c_enabled).value or "1").strip().lower()
+                if enabled_raw in {"0", "false", "no"}:
+                    continue
+                k = str(ws_cp.cell(r, c_key).value or "").strip()
+                if not k:
+                    continue
+                v = str(ws_cp.cell(r, c_val).value or "").strip()
+                cp[k] = v
+            cfg["contribution_policy"] = cp
 
         ws_formula = get_sheet_by_loose_name(wb, ["income_formulas", "收入汇总公式"])
         if ws_formula is not None:
@@ -500,6 +953,27 @@ def load_income_rules() -> Dict[str, Any]:
             cfg["text_templates"] = merged
         break
     return cfg
+
+
+def _pick_income_sign_policy(policies: List[Dict[str, Any]], total_gp: Optional[float], has_pos: bool, has_neg: bool) -> Dict[str, Any]:
+    if total_gp is None:
+        return {}
+    all_same_sign = (has_pos != has_neg) and (has_pos or has_neg)
+    mixed_sign = has_pos and has_neg
+    for p in policies:
+        cond = str(p.get("condition_expr", "")).lower()
+        if "total_gp>0" in cond and not (total_gp > 0):
+            continue
+        if "total_gp<0" in cond and not (total_gp < 0):
+            continue
+        if "total_gp==0" in cond and not (abs(total_gp) < 1e-12):
+            continue
+        if "all_same_sign=true" in cond and not all_same_sign:
+            continue
+        if "mixed_sign=true" in cond and not mixed_sign:
+            continue
+        return p
+    return {}
 
 
 def load_ratio_analysis_rules() -> Dict[str, Any]:
@@ -1205,7 +1679,7 @@ def read_ratio_rows(ws) -> Dict[str, Any]:
     return {"sheet_title": ws.title, "years": years, "rows": rows}
 
 
-def read_sheet_rows(wb, group: Dict[str, Any]) -> Dict[str, Any]:
+def read_sheet_rows(wb, group: Dict[str, Any], project_id: Optional[str] = None) -> Dict[str, Any]:
     ws = get_sheet_by_loose_name(wb, group["candidates"])
     if ws is None:
         return {"sheet_title": None, "years": [], "rows": []}
@@ -1231,18 +1705,26 @@ def read_sheet_rows(wb, group: Dict[str, Any]) -> Dict[str, Any]:
 
         rows.append({"code": code, "name": name, "values": vals})
 
+    rows = apply_value_overrides_to_rows(rows, years, str(group.get("id", "")), project_id)
     return {"sheet_title": ws.title, "years": years, "rows": rows}
 
 
-def trend_text(curr: Optional[float], prev: Optional[float], stable_pct: float = 2.0) -> str:
+def trend_text(
+    curr: Optional[float],
+    prev: Optional[float],
+    stable_pct: float = 2.0,
+    up_label: str = "增加",
+    down_label: str = "减少",
+    stable_label: str = "保持稳定",
+) -> str:
     if curr is None or prev in (None, 0):
         return "待补充"
     pct = (curr - prev) / abs(prev) * 100.0
     if pct > stable_pct:
-        return f"增加{abs(pct):.2f}%"
+        return f"{up_label}{abs(pct):.2f}%"
     if pct < -stable_pct:
-        return f"减少{abs(pct):.2f}%"
-    return f"保持稳定（变动{abs(pct):.2f}%）"
+        return f"{down_label}{abs(pct):.2f}%"
+    return f"{stable_label}（变动{abs(pct):.2f}%）"
 
 
 def _empty_year_values(years: List[str]) -> Dict[str, Optional[float]]:
@@ -1262,13 +1744,29 @@ def _fmt_income_auto_text(
     values: Dict[str, Optional[float]],
     years: List[str],
     stable_pct: float = 2.0,
+    trend_labels: Optional[Dict[str, str]] = None,
     text_templates: Optional[Dict[str, str]] = None,
 ) -> str:
     if len(years) < 3:
         return ""
     y1, y2, y3 = years[:3]
-    t21 = trend_text(values.get(y2), values.get(y1), stable_pct=stable_pct)
-    t32 = trend_text(values.get(y3), values.get(y2), stable_pct=stable_pct)
+    labels = trend_labels or {}
+    t21 = trend_text(
+        values.get(y2),
+        values.get(y1),
+        stable_pct=stable_pct,
+        up_label=str(labels.get("up_label", "增加")),
+        down_label=str(labels.get("down_label", "减少")),
+        stable_label=str(labels.get("stable_label", "保持稳定")),
+    )
+    t32 = trend_text(
+        values.get(y3),
+        values.get(y2),
+        stable_pct=stable_pct,
+        up_label=str(labels.get("up_label", "增加")),
+        down_label=str(labels.get("down_label", "减少")),
+        stable_label=str(labels.get("stable_label", "保持稳定")),
+    )
     tpl = (text_templates or {}).get("income_segment_value", DEFAULT_TEXT_TEMPLATES["income_segment_value"])
     return _render_template(
         tpl,
@@ -1296,15 +1794,22 @@ def _calc_ratio_pct(numer: Optional[float], denom: Optional[float]) -> Optional[
     return numer / denom * 100.0
 
 
-def _trend_pp_text(curr: Optional[float], prev: Optional[float], stable_pp: float = 2.0) -> str:
+def _trend_pp_text(
+    curr: Optional[float],
+    prev: Optional[float],
+    stable_pp: float = 2.0,
+    up_label: str = "上升",
+    down_label: str = "下降",
+    stable_label: str = "基本稳定",
+) -> str:
     if curr is None or prev is None:
         return "待补充"
     delta = curr - prev
     if delta > stable_pp:
-        return f"上升{abs(delta):.2f}个百分点"
+        return f"{up_label}{abs(delta):.2f}个百分点"
     if delta < -stable_pp:
-        return f"下降{abs(delta):.2f}个百分点"
-    return f"基本稳定（变动{abs(delta):.2f}个百分点）"
+        return f"{down_label}{abs(delta):.2f}个百分点"
+    return f"{stable_label}（变动{abs(delta):.2f}个百分点）"
 
 
 def _trend_word(curr: Optional[float], prev: Optional[float], stable_pp: float = 2.0) -> str:
@@ -1324,6 +1829,7 @@ def _fmt_ratio_auto_text(
     denom_values: Dict[str, Optional[float]],
     years: List[str],
     stable_pp: float = 2.0,
+    trend_labels: Optional[Dict[str, str]] = None,
     text_templates: Optional[Dict[str, str]] = None,
 ) -> str:
     if len(years) < 3:
@@ -1332,8 +1838,23 @@ def _fmt_ratio_auto_text(
     r1 = _calc_ratio_pct(numer_values.get(y1), denom_values.get(y1))
     r2 = _calc_ratio_pct(numer_values.get(y2), denom_values.get(y2))
     r3 = _calc_ratio_pct(numer_values.get(y3), denom_values.get(y3))
-    t21 = _trend_pp_text(r2, r1, stable_pp=stable_pp)
-    t32 = _trend_pp_text(r3, r2, stable_pp=stable_pp)
+    labels = trend_labels or {}
+    t21 = _trend_pp_text(
+        r2,
+        r1,
+        stable_pp=stable_pp,
+        up_label=str(labels.get("up_label", "上升")),
+        down_label=str(labels.get("down_label", "下降")),
+        stable_label=str(labels.get("stable_label", "基本稳定")),
+    )
+    t32 = _trend_pp_text(
+        r3,
+        r2,
+        stable_pp=stable_pp,
+        up_label=str(labels.get("up_label", "上升")),
+        down_label=str(labels.get("down_label", "下降")),
+        stable_label=str(labels.get("stable_label", "基本稳定")),
+    )
     tpl = (text_templates or {}).get("income_segment_share", DEFAULT_TEXT_TEMPLATES["income_segment_share"])
     return _render_template(
         tpl,
@@ -1354,8 +1875,26 @@ def _fmt_ratio_auto_text(
             "i3": _fmt_pct(r3),
             "it21": t21,
             "it32": t32,
+            "n1": _fmt_pct(r1),
+            "n2": _fmt_pct(r2),
+            "n3": _fmt_pct(r3),
+            "nt21": t21,
+            "nt32": t32,
         },
     )
+
+
+def _to_bool_like(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _append_text(base: str, addon: str) -> str:
@@ -1525,8 +2064,9 @@ def build_income_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     if ws is None:
         return {"sheet_title": None, "years": [], "tree": [], "nodes": []}
 
-    years = parse_years_from_sheet(ws)
-    years = years[:3]
+    is_group = next((g for g in SHEET_GROUPS if g.get("id") == "is"), None)
+    is_data = read_sheet_rows(wb, is_group, project_id=project_id) if is_group else {"years": [], "rows": []}
+    years = (is_data.get("years", []) or parse_years_from_sheet(ws))[:3]
     if len(years) < 3:
         return {"sheet_title": ws.title, "years": years, "tree": [], "nodes": []}
     y1, y2, y3 = years
@@ -1534,29 +2074,59 @@ def build_income_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     yoy_stable_pct = float(income_rules.get("yoy_stable_pct", 2.0))
     share_stable_pp = float(income_rules.get("share_stable_pp", 2.0))
     income_text_templates = dict(income_rules.get("text_templates", {}))
+    sign_policies = list(income_rules.get("sign_policies", []))
+    trend_cfg = dict(income_rules.get("trend_thresholds", {}))
+    contrib_policy = dict(income_rules.get("contribution_policy", {}))
+    store = load_store(project_id)
+    entries = store.get("entries", {})
+    pending_class_ids = {"2.1.2.4", "2.1.2.5", "2.1.2.6"}
 
-    is_rows: List[Dict[str, Any]] = []
-    for r in range(2, ws.max_row + 1):
-        code = str(ws.cell(r, 1).value or "").strip()
-        name = str(ws.cell(r, 2).value or "").strip()
-        if not code or not name or not re.match(r"^IS\d+$", code):
-            continue
-        is_rows.append(
-            {
-                "code": code,
-                "name": name,
-                "values": {y1: normalize_num(ws.cell(r, 3).value), y2: normalize_num(ws.cell(r, 4).value), y3: normalize_num(ws.cell(r, 5).value)},
-            }
-        )
+    def _default_bucket_for_node(nid: str, node_obj: Optional[Dict[str, Any]] = None) -> str:
+        node = node_obj or {}
+        pid = str(node.get("parent_id", "")).strip()
+        if pid == "2.1.2":
+            return "recurring"
+        if pid == "2.2":
+            return "nonrecurring"
+        if nid in pending_class_ids:
+            return "nonrecurring"
+        return "nonrecurring"
+
+    def _normalize_bucket(v: Any, default_bucket: str = "nonrecurring") -> str:
+        t = str(v or "").strip().lower()
+        if t in {"recurring", "经常性", "regular"}:
+            return "recurring"
+        if t in {"nonrecurring", "non_recurring", "非经常性", "irregular"}:
+            return "nonrecurring"
+        return default_bucket
+
+    def _metric_trend(metric_id: str, fallback_stable: float, fallback_unit: str) -> Dict[str, Any]:
+        raw = trend_cfg.get(metric_id, {}) if isinstance(trend_cfg, dict) else {}
+        return {
+            "stable": float(raw.get("stable", fallback_stable)),
+            "unit": str(raw.get("unit", fallback_unit)),
+            "up_label": str(raw.get("up_label", "")),
+            "down_label": str(raw.get("down_label", "")),
+            "stable_label": str(raw.get("stable_label", "")),
+        }
+
+    is_rows: List[Dict[str, Any]] = list(is_data.get("rows", []) or [])
 
     segments = _detect_income_segments(wb, years)
 
     def make_node(node_id: str, parent_id: str, label: str, values: Dict[str, Optional[float]], source_code: str = "", source_name: str = "") -> Dict[str, Any]:
+        metric = "gp_value" if parent_id == "2.1.1" else "rev_yoy"
+        mcfg = _metric_trend(metric, fallback_stable=yoy_stable_pct, fallback_unit="ratio")
         auto_text = _fmt_income_auto_text(
             label,
             values,
             years,
-            stable_pct=yoy_stable_pct,
+            stable_pct=float(mcfg["stable"]),
+            trend_labels={
+                "up_label": mcfg["up_label"] or "增加",
+                "down_label": mcfg["down_label"] or "减少",
+                "stable_label": mcfg["stable_label"] or "保持稳定",
+            },
             text_templates=income_text_templates,
         )
         return {
@@ -1701,14 +2271,42 @@ def build_income_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     by_node = {n["node_id"]: n for n in nodes}
     formula_rules = income_rules.get("formula_rules", []) or []
     formula_map = {str(x.get("node_id", "")).strip(): str(x.get("formula", "")).strip() for x in formula_rules}
+    recurring_keys = set(income_rules.get("recurring_keys", DEFAULT_RECURRING_KEYS))
+    nonrec_keys = set(income_rules.get("nonrec_keys", DEFAULT_NONREC_KEYS))
+    editable_ids: set = set()
+    for nid, n in by_node.items():
+        label = str(n.get("label", ""))
+        pid = str(n.get("parent_id", "")).strip()
+        if nid in pending_class_ids or ("待判定" in label) or pid in {"2.1.2", "2.2"}:
+            editable_ids.add(nid)
+    for nid in editable_ids:
+        saved = entries.get(make_entry_key("income_analysis", nid), {})
+        node = by_node.get(nid)
+        default_bucket = _default_bucket_for_node(nid, node)
+        bucket = _normalize_bucket(
+            saved.get("classification_bucket") or saved.get("profit_bucket") or saved.get("class_bucket"),
+            default_bucket=default_bucket,
+        )
+        recurring_keys.discard(nid)
+        nonrec_keys.discard(nid)
+        if bucket == "recurring":
+            recurring_keys.add(nid)
+        else:
+            nonrec_keys.add(nid)
+        if node is not None:
+            node["classification_editable"] = True
+            node["classification_bucket"] = bucket
     if not formula_map:
-        recurring_keys = set(income_rules.get("recurring_keys", DEFAULT_RECURRING_KEYS))
-        nonrec_keys = set(income_rules.get("nonrec_keys", DEFAULT_NONREC_KEYS))
         formula_map = {
             "3.1": f"SUM({','.join(sorted(recurring_keys))})",
             "3.2": f"SUM({','.join(sorted(nonrec_keys))})",
             "3.3": "SUB(3.1,3.2)",
         }
+    elif editable_ids:
+        # Keep rule formulas for other nodes, but 3.1/3.2 follow per-project manual classification.
+        formula_map["3.1"] = f"SUM({','.join(sorted(recurring_keys))})"
+        formula_map["3.2"] = f"SUM({','.join(sorted(nonrec_keys))})"
+        formula_map.setdefault("3.3", "SUB(3.1,3.2)")
 
     output_order = [nid for nid in [x.get("node_id", "") for x in fixed_tree] if str(nid).startswith("3.")]
     if not output_order:
@@ -1733,37 +2331,347 @@ def build_income_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     by_node = {n["node_id"]: n for n in nodes}
     total_revenue_values = by_node.get("1.1", {}).get("values", _empty_year_values(years))
     total_gross_values = by_node.get("2.1.1", {}).get("values", _empty_year_values(years))
+    gp_nodes = [x for x in nodes if x.get("parent_id") == "2.1.1"]
+    gp_abs_sum_values: Dict[str, Optional[float]] = _empty_year_values(years)
+    gp_has_pos: Dict[str, bool] = {y: False for y in years[:3]}
+    gp_has_neg: Dict[str, bool] = {y: False for y in years[:3]}
+    for y in years[:3]:
+        vals = []
+        for x in gp_nodes:
+            v = (x.get("values", {}) if isinstance(x.get("values"), dict) else {}).get(y)
+            if v is None:
+                continue
+            vals.append(v)
+            if v > 0:
+                gp_has_pos[y] = True
+            if v < 0:
+                gp_has_neg[y] = True
+        gp_abs_sum_values[y] = sum(abs(v) for v in vals) if vals else None
+
+    gp_mode = str(contrib_policy.get("gp_share_mode", "impact_when_mixed_or_total_negative")).strip() or "impact_when_mixed_or_total_negative"
+    gp_label_impact = str(contrib_policy.get("impact_ratio_label", "毛利贡献（驱动占比）")).strip() or "毛利贡献（驱动占比）"
+    gp_label_algebraic = str(contrib_policy.get("algebraic_ratio_label", "毛利贡献（占总毛利比例）")).strip() or "毛利贡献（占总毛利比例）"
+    gp_basis_impact = str(contrib_policy.get("basis_impact_text", "按绝对值口径")).strip() or "按绝对值口径"
+    gp_basis_algebraic = str(contrib_policy.get("basis_algebraic_text", "按代数口径")).strip() or "按代数口径"
+    net_attr_enabled = _to_bool_like(contrib_policy.get("net_attr_enabled", "0"), default=False)
+    net_attr_label = (
+        str(contrib_policy.get("net_attr_ratio_label", "对全部分项业务毛利影响总量的占比")).strip()
+        or "对全部分项业务毛利影响总量的占比"
+    )
+    strength_ratio_label = str(contrib_policy.get("strength_ratio_label", "驱动占比")).strip() or "驱动占比"
+    display_dual_caliber = _to_bool_like(contrib_policy.get("display_dual_caliber", "0"), default=False)
+    zero_total_policy = str(contrib_policy.get("zero_total_policy", "strength_only")).strip().lower() or "strength_only"
+
+    def _use_impact_ratio_fallback(year: str, total_gp: Optional[float]) -> bool:
+        mixed = bool(gp_has_pos.get(year, False) and gp_has_neg.get(year, False))
+        if gp_mode == "impact_always":
+            return True
+        if gp_mode == "algebraic_always":
+            return False
+        # default: impact when mixed sign or total gross <= 0
+        return mixed or (total_gp is not None and total_gp <= 0)
     for n in nodes:
         if n.get("parent_id") == "1" and n.get("node_id") != "1.1":
+            scfg = _metric_trend("rev_share", fallback_stable=share_stable_pp, fallback_unit="pct_point")
             ratio_txt = _fmt_ratio_auto_text(
                 "占营业收入总额比例",
                 n.get("values", {}),
                 total_revenue_values,
                 years,
-                stable_pp=share_stable_pp,
+                stable_pp=float(scfg["stable"]),
+                trend_labels={
+                    "up_label": scfg["up_label"] or "上升",
+                    "down_label": scfg["down_label"] or "下降",
+                    "stable_label": scfg["stable_label"] or "基本稳定",
+                },
                 text_templates=income_text_templates,
             )
             n["auto_text"] = _append_text(n.get("auto_text", ""), ratio_txt)
         if n.get("parent_id") == "2.1.1":
+            gcfg = _metric_trend("gp_share_impact", fallback_stable=share_stable_pp, fallback_unit="pct_point")
+            numer_values: Dict[str, Optional[float]] = _empty_year_values(years)
+            denom_values: Dict[str, Optional[float]] = _empty_year_values(years)
+            basis_by_year: Dict[str, str] = {y: "待补充" for y in years[:3]}
+            for y in years[:3]:
+                seg_gp = (n.get("values", {}) if isinstance(n.get("values"), dict) else {}).get(y)
+                total_gp = total_gross_values.get(y)
+                policy_y = _pick_income_sign_policy(sign_policies, total_gp, gp_has_pos.get(y, False), gp_has_neg.get(y, False))
+                metric_y = str(policy_y.get("primary_ratio_metric", "")).strip().lower()
+                if metric_y == "gp_share_impact":
+                    use_impact = True
+                elif metric_y == "gp_share_algebraic":
+                    use_impact = False
+                else:
+                    use_impact = _use_impact_ratio_fallback(y, total_gp)
+                if use_impact:
+                    numer_values[y] = abs(seg_gp) if seg_gp is not None else None
+                    denom_values[y] = gp_abs_sum_values.get(y)
+                    basis_by_year[y] = gp_basis_impact
+                else:
+                    numer_values[y] = seg_gp
+                    denom_values[y] = total_gp
+                    basis_by_year[y] = gp_basis_algebraic
+            latest_basis = basis_by_year.get(years[-1], gp_basis_impact)
+            ratio_label = gp_label_impact if latest_basis == gp_basis_impact else gp_label_algebraic
             ratio_txt = _fmt_ratio_auto_text(
-                "毛利贡献（占总毛利比例）",
-                n.get("values", {}),
-                total_gross_values,
+                ratio_label,
+                numer_values,
+                denom_values,
                 years,
-                stable_pp=share_stable_pp,
+                stable_pp=float(gcfg["stable"]),
+                trend_labels={
+                    "up_label": gcfg["up_label"] or "上升",
+                    "down_label": gcfg["down_label"] or "下降",
+                    "stable_label": gcfg["stable_label"] or "基本稳定",
+                },
                 text_templates=income_text_templates,
             )
             n["auto_text"] = _append_text(n.get("auto_text", ""), ratio_txt)
+            basis_tpl = income_text_templates.get("gross_contribution_basis", DEFAULT_TEXT_TEMPLATES["gross_contribution_basis"])
+            basis_txt = _render_template(
+                basis_tpl,
+                {
+                    "y1": years[0],
+                    "y2": years[1],
+                    "y3": years[2],
+                    "b1": basis_by_year.get(years[0], "待补充"),
+                    "b2": basis_by_year.get(years[1], "待补充"),
+                    "b3": basis_by_year.get(years[2], "待补充"),
+                },
+            )
+            n["auto_text"] = _append_text(n.get("auto_text", ""), basis_txt)
+            if net_attr_enabled:
+                abs_total_values: Dict[str, Optional[float]] = _empty_year_values(years)
+                for y in years[:3]:
+                    tg = total_gross_values.get(y)
+                    abs_total_values[y] = abs(tg) if tg is not None and abs(tg) > 1e-12 else None
+                if zero_total_policy != "strength_only" or any(v is not None for v in abs_total_values.values()):
+                    net_ratio_txt = _fmt_ratio_auto_text(
+                        net_attr_label,
+                        n.get("values", {}),
+                        abs_total_values,
+                        years,
+                        stable_pp=float(gcfg["stable"]),
+                        trend_labels={
+                            "up_label": gcfg["up_label"] or "上升",
+                            "down_label": gcfg["down_label"] or "下降",
+                            "stable_label": gcfg["stable_label"] or "基本稳定",
+                        },
+                        text_templates={
+                            "income_segment_share": income_text_templates.get(
+                                "gross_segment_net_attr", DEFAULT_TEXT_TEMPLATES["gross_segment_net_attr"]
+                            )
+                        },
+                    )
+                    n["auto_text"] = _append_text(n.get("auto_text", ""), net_ratio_txt)
+                    if display_dual_caliber and len(years) >= 3:
+                        latest_y = years[2]
+                        seg_gp_latest = (n.get("values", {}) if isinstance(n.get("values"), dict) else {}).get(latest_y)
+                        total_gp_latest = total_gross_values.get(latest_y)
+                        strength_latest = _calc_ratio_pct(numer_values.get(latest_y), denom_values.get(latest_y))
+                        net_latest = (
+                            seg_gp_latest / abs(total_gp_latest) * 100.0
+                            if seg_gp_latest is not None and total_gp_latest is not None and abs(total_gp_latest) > 1e-12
+                            else None
+                        )
+                        dual_tpl = income_text_templates.get(
+                            "gross_segment_dual_view", DEFAULT_TEXT_TEMPLATES["gross_segment_dual_view"]
+                        )
+                        dual_txt = _render_template(
+                            dual_tpl,
+                            {
+                                "strength_label": strength_ratio_label,
+                                "s_latest": _fmt_pct(strength_latest),
+                                "net_label": net_attr_label,
+                                "n_latest": _fmt_pct(net_latest),
+                            },
+                        )
+                        n["auto_text"] = _append_text(n.get("auto_text", ""), dual_txt)
+            # Scenario-based qualitative labels from sign_scenario_policy.
+            latest_y = years[-1]
+            latest_total_gp = total_gross_values.get(latest_y)
+            latest_seg_gps = [((x.get("values", {}) if isinstance(x.get("values"), dict) else {}).get(latest_y)) for x in nodes if x.get("parent_id") == "2.1.1"]
+            has_pos = any((v is not None and v > 0) for v in latest_seg_gps)
+            has_neg = any((v is not None and v < 0) for v in latest_seg_gps)
+            p = _pick_income_sign_policy(sign_policies, latest_total_gp, has_pos, has_neg)
+            seg_gp = (n.get("values", {}) if isinstance(n.get("values"), dict) else {}).get(latest_y)
+            if p:
+                pos_word = str(p.get("direction_label_pos", "")).strip() or "正向项"
+                neg_word = str(p.get("direction_label_neg", "")).strip() or "负向项"
+                if seg_gp is None:
+                    qual_word = "待补充"
+                elif seg_gp > 0:
+                    qual_word = pos_word
+                elif seg_gp < 0:
+                    qual_word = neg_word
+                else:
+                    qual_word = "中性项"
+                scn = str(p.get("scenario", "")).strip()
+                scn_tpl = income_text_templates.get(
+                    "gross_segment_scenario_judgement", DEFAULT_TEXT_TEMPLATES["gross_segment_scenario_judgement"]
+                )
+                qual_txt = _render_template(
+                    scn_tpl,
+                    {"latest_year": latest_y, "qual_word": qual_word, "scenario": scn},
+                )
+                n["auto_text"] = _append_text(n.get("auto_text", ""), qual_txt)
+
+    # Keep segment-level gross-profit nodes concise: only absolute value + trend.
+    gp_value_cfg = _metric_trend("gp_value", fallback_stable=yoy_stable_pct, fallback_unit="ratio")
+    for n in nodes:
+        if n.get("parent_id") != "2.1.1":
+            continue
+        n["auto_text"] = _fmt_income_auto_text(
+            str(n.get("label", "")),
+            n.get("values", {}) if isinstance(n.get("values"), dict) else _empty_year_values(years),
+            years,
+            stable_pct=float(gp_value_cfg["stable"]),
+            trend_labels={
+                "up_label": gp_value_cfg["up_label"] or "增加",
+                "down_label": gp_value_cfg["down_label"] or "减少",
+                "stable_label": gp_value_cfg["stable_label"] or "保持稳定",
+            },
+            text_templates=income_text_templates,
+        )
+
+    # Contribution analysis is shown on summary nodes only (e.g., 2.1.1 / 3.1).
+    by_node = {n["node_id"]: n for n in nodes}
+
+    def _append_summary_contrib(summary_id: str, child_ids: List[str], title: str) -> None:
+        sn = by_node.get(summary_id)
+        if not sn or len(years) < 3:
+            return
+        latest_y = years[-1]
+        total_latest = (sn.get("values", {}) if isinstance(sn.get("values"), dict) else {}).get(latest_y)
+        childs = [by_node[cid] for cid in child_ids if cid in by_node]
+        if not childs:
+            return
+        seg_vals = [((x.get("values", {}) if isinstance(x.get("values"), dict) else {}).get(latest_y)) for x in childs]
+        has_pos = any(v is not None and v > 0 for v in seg_vals)
+        has_neg = any(v is not None and v < 0 for v in seg_vals)
+        sum_abs = sum(abs(v) for v in seg_vals if v is not None)
+        p = _pick_income_sign_policy(sign_policies, total_latest, has_pos, has_neg)
+        pos_word = str((p or {}).get("direction_label_pos", "")).strip() or "正向项"
+        neg_word = str((p or {}).get("direction_label_neg", "")).strip() or "负向项"
+        lines: List[str] = []
+        def _fmt_amount(v: Optional[float]) -> str:
+            return f"{v:.2f}" if v is not None else "待补充"
+        def _fmt_signed_pct(v: Optional[float]) -> str:
+            if v is None:
+                return "待补充"
+            return f"{v:+.2f}%"
+        hdr_missing_tpl = income_text_templates.get(
+            "profit_summary_header_missing", DEFAULT_TEXT_TEMPLATES["profit_summary_header_missing"]
+        )
+        hdr_pos_tpl = income_text_templates.get(
+            "profit_summary_header_positive", DEFAULT_TEXT_TEMPLATES["profit_summary_header_positive"]
+        )
+        hdr_zero_tpl = income_text_templates.get(
+            "profit_summary_header_zero", DEFAULT_TEXT_TEMPLATES["profit_summary_header_zero"]
+        )
+        hdr_neg_tpl = income_text_templates.get(
+            "profit_summary_header_negative", DEFAULT_TEXT_TEMPLATES["profit_summary_header_negative"]
+        )
+        line_pos_tpl = income_text_templates.get(
+            "profit_summary_line_positive", DEFAULT_TEXT_TEMPLATES["profit_summary_line_positive"]
+        )
+        line_neg_tpl = income_text_templates.get(
+            "profit_summary_line_negative", DEFAULT_TEXT_TEMPLATES["profit_summary_line_negative"]
+        )
+        line_zero_tpl = income_text_templates.get(
+            "profit_summary_line_zero", DEFAULT_TEXT_TEMPLATES["profit_summary_line_zero"]
+        )
+        if total_latest is None:
+            header = _render_template(
+                hdr_missing_tpl,
+                {"title": title, "latest_year": latest_y},
+            )
+        elif total_latest > 0:
+            header = _render_template(
+                hdr_pos_tpl,
+                {"title": title, "latest_year": latest_y, "total_amount": _fmt_amount(total_latest)},
+            )
+        elif abs(total_latest) < 1e-12:
+            header = _render_template(
+                hdr_zero_tpl,
+                {"title": title, "latest_year": latest_y},
+            )
+        else:
+            header = _render_template(
+                hdr_neg_tpl,
+                {"title": title, "latest_year": latest_y, "total_abs_amount": _fmt_amount(abs(total_latest))},
+            )
+        for c in childs:
+            name = str(c.get("label", "")).strip()
+            v = (c.get("values", {}) if isinstance(c.get("values"), dict) else {}).get(latest_y)
+            if v is None:
+                continue
+            net_attr = (v / sum_abs * 100.0) if sum_abs > 1e-12 else None
+            if v > 0:
+                lines.append(
+                    _render_template(
+                        line_pos_tpl,
+                        {
+                            "name": name,
+                            "amount": _fmt_amount(v),
+                            "net_attr_label": net_attr_label,
+                            "net_attr_pct": _fmt_signed_pct(net_attr),
+                            "direction_word": pos_word,
+                        },
+                    )
+                )
+            elif v < 0:
+                lines.append(
+                    _render_template(
+                        line_neg_tpl,
+                        {
+                            "name": name,
+                            "abs_amount": _fmt_amount(abs(v)),
+                            "net_attr_label": net_attr_label,
+                            "net_attr_pct": _fmt_signed_pct(net_attr),
+                            "direction_word": neg_word,
+                        },
+                    )
+                )
+            else:
+                lines.append(
+                    _render_template(
+                        line_zero_tpl,
+                        {
+                            "name": name,
+                            "net_attr_label": net_attr_label,
+                            "net_attr_pct": _fmt_signed_pct(net_attr),
+                        },
+                    )
+                )
+        if not lines:
+            return
+        summary_text = header + "\n" + "\n".join(lines)
+        sn["auto_text"] = _append_text(sn.get("auto_text", ""), summary_text)
+
+    gp_child_ids = [str(x.get("node_id", "")) for x in nodes if x.get("parent_id") == "2.1.1"]
+    _append_summary_contrib("2.1.1", gp_child_ids, "子项贡献")
+
+    recurring_keys = set(income_rules.get("recurring_keys", DEFAULT_RECURRING_KEYS))
+    recurring_child_ids = [nid for nid in recurring_keys if nid in by_node and nid != "3.1"]
+    _append_summary_contrib("3.1", sorted(recurring_child_ids), "经常性收益构成贡献")
 
     # Merge manual store
-    store = load_store(project_id)
-    entries = store.get("entries", {})
     for n in nodes:
         saved = entries.get(make_entry_key("income_analysis", n["node_id"]), {})
         manual = str(saved.get("manual_text", "") or "")
         confirmed = bool(saved.get("confirmed", False))
         n["manual_text"] = manual
         n["confirmed"] = confirmed
+        if bool(n.get("classification_editable", False)):
+            default_bucket = _default_bucket_for_node(str(n.get("node_id", "")).strip(), n)
+            n["classification_bucket"] = _normalize_bucket(
+                saved.get("classification_bucket") or saved.get("profit_bucket") or saved.get("class_bucket"),
+                default_bucket=default_bucket,
+            )
+        else:
+            n["classification_editable"] = False
+            n["classification_bucket"] = ""
         n["final_text"] = manual if manual.strip() else n["auto_text"]
 
     return {
@@ -1909,6 +2817,444 @@ def build_liability_analysis_map(wb, project_id: str) -> Dict[str, Dict[str, Any
     return build_analysis_map(wb, project_id, LIABILITY_ANALYSIS_SHEETS, "liability_analysis")
 
 
+def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
+    bs_group = next((g for g in SHEET_GROUPS if g["id"] == "bs"), None)
+    is_group = next((g for g in SHEET_GROUPS if g["id"] == "is"), None)
+    bs_data = read_sheet_rows(wb, bs_group, project_id=project_id) if bs_group else {"years": [], "rows": []}
+    is_data = read_sheet_rows(wb, is_group, project_id=project_id) if is_group else {"years": [], "rows": []}
+    income_data = build_income_analysis_map(wb, project_id)
+
+    years = (bs_data.get("years") or is_data.get("years") or income_data.get("years") or [])[:3]
+    if len(years) < 3:
+        years = (income_data.get("years") or bs_data.get("years") or is_data.get("years") or [])[:3]
+    if len(years) < 3:
+        years = ["2022", "2023", "2024"]
+
+    bs_rows = bs_data.get("rows", []) or []
+    is_rows = is_data.get("rows", []) or []
+    income_nodes = {str(n.get("node_id", "")): n for n in (income_data.get("nodes", []) or [])}
+
+    bs_by_code = {str(r.get("code", "")).strip().upper(): r for r in bs_rows}
+    is_by_code = {str(r.get("code", "")).strip().upper(): r for r in is_rows}
+
+    def _find_is_row(code_candidates: List[str], name_keywords: List[str]) -> Optional[Dict[str, Any]]:
+        r = _pick_is_row(is_rows, code_candidates or [], name_keywords or [])
+        return r
+
+    def _pick_bs_value(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
+        for c in item.get("code_candidates", []):
+            row = bs_by_code.get(str(c).strip().upper())
+            if row:
+                vals = row.get("values", {}) if isinstance(row.get("values"), dict) else {}
+                return {y: vals.get(y) for y in years}
+        return {y: None for y in years}
+
+    def _pick_is_value(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
+        row = _find_is_row(item.get("code_candidates", []), item.get("name_keywords", []))
+        vals = (row.get("values", {}) if row and isinstance(row.get("values"), dict) else {})
+        return {y: vals.get(y) for y in years}
+
+    def _pick_income_node_value(node_id: str) -> Dict[str, Optional[float]]:
+        n = income_nodes.get(node_id, {})
+        vals = n.get("values", {}) if isinstance(n.get("values"), dict) else {}
+        return {y: vals.get(y) for y in years}
+
+    def _fmt_amt(v: Optional[float]) -> str:
+        return f"{v:.2f}" if v is not None else "待补充"
+
+    def _yoy(curr: Optional[float], prev: Optional[float], stable: float = 2.0) -> str:
+        if curr is None or prev in (None, 0):
+            return "待补充"
+        p = (curr - prev) / abs(prev) * 100.0
+        if p > stable:
+            return f"增加{abs(p):.2f}%"
+        if p < -stable:
+            return f"减少{abs(p):.2f}%"
+        return f"基本稳定（变动{abs(p):.2f}%）"
+
+    def _ratio_pct(numer: Optional[float], denom: Optional[float]) -> Optional[float]:
+        if numer is None or denom in (None, 0):
+            return None
+        return numer / denom * 100.0
+
+    def _pp_change(curr: Optional[float], prev: Optional[float], stable_pp: float = 2.0) -> str:
+        if curr is None or prev is None:
+            return "待补充"
+        d = curr - prev
+        if d > stable_pp:
+            return f"上升{abs(d):.2f}个百分点"
+        if d < -stable_pp:
+            return f"下降{abs(d):.2f}个百分点"
+        return f"基本稳定（变动{abs(d):.2f}个百分点）"
+
+    def _code_num(code: str) -> Optional[int]:
+        m = re.match(r"^BS(\d{3})$", str(code or "").strip().upper())
+        return int(m.group(1)) if m else None
+
+    def _build_bs_components(num_ranges: List[tuple], excludes: Optional[set] = None) -> List[Dict[str, Any]]:
+        excludes = excludes or set()
+        out: List[Dict[str, Any]] = []
+        for r in bs_rows:
+            code = str(r.get("code", "")).strip().upper()
+            n = _code_num(code)
+            if n is None or code in excludes:
+                continue
+            hit = any(a <= n <= b for (a, b) in num_ranges)
+            if not hit:
+                continue
+            vals = r.get("values", {}) if isinstance(r.get("values"), dict) else {}
+            out.append({"code": code, "name": str(r.get("name", "")), "values": {y: vals.get(y) for y in years}})
+        return out
+
+    def _build_income_components() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for n in (income_data.get("nodes", []) or []):
+            nid = str(n.get("node_id", "")).strip()
+            pid = str(n.get("parent_id", "")).strip()
+            if pid != "1" or nid == "1.1":
+                continue
+            vals = n.get("values", {}) if isinstance(n.get("values"), dict) else {}
+            out.append({"code": nid, "name": str(n.get("label", "")), "values": {y: vals.get(y) for y in years}})
+        return out
+
+    def _build_gp_components() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for n in (income_data.get("nodes", []) or []):
+            nid = str(n.get("node_id", "")).strip()
+            pid = str(n.get("parent_id", "")).strip()
+            if pid != "2.1.1":
+                continue
+            vals = n.get("values", {}) if isinstance(n.get("values"), dict) else {}
+            out.append({"code": nid, "name": str(n.get("label", "")), "values": {y: vals.get(y) for y in years}})
+        return out
+
+    def _up_down_pp(delta: Optional[float]) -> str:
+        if delta is None:
+            return "待补充"
+        if delta > 0:
+            return f"上升{abs(delta):.2f}个百分点"
+        if delta < 0:
+            return f"下降{abs(delta):.2f}个百分点"
+        return f"基本稳定（变动{abs(delta):.2f}个百分点）"
+
+    def _top_migration_text(total_vals: Dict[str, Optional[float]], comps: List[Dict[str, Any]], coverage_target_pct: float = 75.0) -> str:
+        if len(years) < 3:
+            return "结构迁移分析待补充。"
+        y1, _, y3 = years[0], years[1], years[2]
+        t1 = total_vals.get(y1)
+        t3 = total_vals.get(y3)
+        records: List[Dict[str, Any]] = []
+        for c in comps:
+            vals = c.get("values", {}) if isinstance(c.get("values"), dict) else {}
+            v1 = vals.get(y1)
+            v3 = vals.get(y3)
+            s1 = _ratio_pct(v1, t1)
+            s3 = _ratio_pct(v3, t3)
+            d = (s3 - s1) if (s3 is not None and s1 is not None) else None
+            nm = str(c.get("name", ""))
+            records.append({"name": nm, "name_norm": re.sub(r"[()（）\s]", "", nm).replace("合计", ""), "s3": s3, "d": d})
+        latest = [x for x in records if x.get("s3") is not None]
+        if not latest:
+            return "结构迁移分析待补充。"
+        latest.sort(key=lambda x: float(x.get("s3") or 0.0), reverse=True)
+        # Remove overlapping duplicates (e.g., "固定资产(合计)" vs "固定资产", "应收票据及应收账款" vs "应收账款").
+        dedup_latest: List[Dict[str, Any]] = []
+        for x in latest:
+            n = str(x.get("name_norm", ""))
+            s = float(x.get("s3") or 0.0)
+            dup = False
+            for k in dedup_latest:
+                nk = str(k.get("name_norm", ""))
+                sk = float(k.get("s3") or 0.0)
+                if not n or not nk:
+                    continue
+                overlap = (n in nk) or (nk in n)
+                near_share = abs(s - sk) <= 1.0
+                if overlap and (near_share or ("及" in str(k.get("name", "")))):
+                    dup = True
+                    break
+            if not dup:
+                dedup_latest.append(x)
+        latest = dedup_latest
+        selected: List[Dict[str, Any]] = []
+        cum = 0.0
+        for x in latest:
+            selected.append(x)
+            cum += float(x.get("s3") or 0.0)
+            if cum >= coverage_target_pct:
+                break
+        top_txt = "、".join([f"{x['name']}（{_fmt_pct(x.get('s3'))}）" for x in selected])
+        deltas = [x for x in records if x.get("d") is not None]
+        up = max(deltas, key=lambda x: x["d"]) if deltas else None
+        down = min(deltas, key=lambda x: x["d"]) if deltas else None
+        move_bits: List[str] = []
+        move_names: set = set()
+        if up is not None and float(up["d"]) > 0:
+            move_bits.append(f"{up['name']}占比上升{abs(float(up['d'])):.2f}个百分点")
+            move_names.add(str(up["name"]))
+        if down is not None and float(down["d"]) < 0:
+            move_bits.append(f"{down['name']}占比下降{abs(float(down['d'])):.2f}个百分点")
+            move_names.add(str(down["name"]))
+        top_delta_bits = []
+        for x in selected[:3]:
+            if str(x["name"]) in move_names:
+                continue
+            top_delta_bits.append(f"{x['name']}占比{_up_down_pp(x.get('d'))}")
+        move_txt = "；".join(move_bits) if move_bits else "内部结构整体稳定"
+        top_delta_txt = "；".join(top_delta_bits) if top_delta_bits else "主要构成项变化待补充"
+        return (
+            f"{y3}年内部构成按占比从高到低分别为：{top_txt}，这几项占比合计{cum:.2f}%。\n"
+            f"{y1}-{y3}年，{move_txt}；同时，{top_delta_txt}。"
+        )
+
+    # Bases for structure text.
+    bs_total = _pick_bs_value({"code_candidates": ["BS057"]})
+    liab_total = _pick_bs_value({"code_candidates": ["BS103"]})
+    income_total = _pick_is_value({"code_candidates": ["IS001"], "name_keywords": ["营业总收入", "营业收入"]})
+    recurring_total = _pick_income_node_value("3.1")
+    nonrec_total = _pick_income_node_value("3.2")
+    op_net_total = {
+        y: ((recurring_total.get(y) or 0.0) + (nonrec_total.get(y) or 0.0))
+        if (recurring_total.get(y) is not None or nonrec_total.get(y) is not None)
+        else None
+        for y in years
+    }
+
+    scale_rows: List[Dict[str, Any]] = []
+    struct_rows: List[Dict[str, Any]] = []
+
+    summary_threshold_cfg = _read_threshold_config()
+    top_coverage_default = float(
+        summary_threshold_cfg.get("summary_top_coverage_default", float(SUMMARY_TOP_COVERAGE_TARGET_PCT))
+    )
+    top_coverage_income = float(
+        summary_threshold_cfg.get("summary_top_coverage_income", float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME))
+    )
+
+    for item in SUMMARY_ANALYSIS_ITEMS:
+        code = str(item["code"])
+        name = str(item["name"])
+        kind = str(item.get("kind", ""))
+        source_code = str(item.get("source_code", ""))
+        if kind == "bs":
+            values = _pick_bs_value(item)
+        elif kind == "is":
+            values = _pick_is_value(item)
+        elif kind == "income_combo":
+            values = dict(op_net_total)
+        elif kind == "income_node":
+            values = _pick_income_node_value(source_code)
+        else:
+            values = {y: None for y in years}
+
+        y1, y2, y3 = years[0], years[1], years[2]
+        v1, v2, v3 = values.get(y1), values.get(y2), values.get(y3)
+        abs_text = (
+            f"{name}：{y1}年{_fmt_amt(v1)}万元，{y2}年{_fmt_amt(v2)}万元，{y3}年{_fmt_amt(v3)}万元；"
+            f"{y2}较{y1}{_yoy(v2, v1)}，{y3}较{y2}{_yoy(v3, v2)}。"
+        )
+        scale_rows.append(
+            {
+                "科目编码": code,
+                "科目名称": name,
+                y1: v1,
+                y2: v2,
+                y3: v3,
+                "定量描述_绝对量": abs_text,
+            }
+        )
+
+        # relative/structure text
+        base_name = ""
+        bvals: Dict[str, Optional[float]] = {y: None for y in years}
+        if code in {"SUM001", "SUM002", "SUM003"}:
+            base_name = "资产总计"
+            bvals = bs_total
+        elif code in {"SUM004", "SUM005", "SUM006"}:
+            base_name = "负债总计"
+            bvals = liab_total
+        elif code == "SUM007":
+            base_name = "营业收入"
+            bvals = income_total
+        elif code in {"SUM009", "SUM010", "SUM011"}:
+            base_name = "经营净收益"
+            bvals = dict(op_net_total)
+
+        r1 = _ratio_pct(v1, bvals.get(y1))
+        r2 = _ratio_pct(v2, bvals.get(y2))
+        r3 = _ratio_pct(v3, bvals.get(y3))
+        rel_text = ""
+        if base_name and code not in {"SUM003", "SUM006", "SUM007", "SUM008", "SUM009", "SUM010", "SUM011"}:
+            rel_text = (
+                f"{name}占{base_name}比例：{y1}年{_fmt_pct(r1)}，{y2}年{_fmt_pct(r2)}，{y3}年{_fmt_pct(r3)}；"
+                f"{y2}较{y1}{_pp_change(r2, r1)}，{y3}较{y2}{_pp_change(r3, r2)}。"
+            )
+        elif code == "SUM007":
+            rel_text = f"{name}：分项结构如下。"
+        elif code in {"SUM003", "SUM006"}:
+            rel_text = f"{name}：为汇总项，结构占比分析不适用。"
+        elif code == "SUM008":
+            c_rec = recurring_total
+            c_non = nonrec_total
+            s_rec_3 = _ratio_pct(c_rec.get(y3), values.get(y3))
+            s_non_3 = _ratio_pct(c_non.get(y3), values.get(y3))
+            s_rec_1 = _ratio_pct(c_rec.get(y1), values.get(y1))
+            s_non_1 = _ratio_pct(c_non.get(y1), values.get(y1))
+            d_rec = (s_rec_3 - s_rec_1) if (s_rec_3 is not None and s_rec_1 is not None) else None
+            d_non = (s_non_3 - s_non_1) if (s_non_3 is not None and s_non_1 is not None) else None
+            rel_text = (
+                f"{y3}年经常性净收益占比{_fmt_pct(s_rec_3)}、非经常性净收益占比{_fmt_pct(s_non_3)}；"
+                f"{y1}-{y3}年，经常性净收益占比{_up_down_pp(d_rec)}；非经常性净收益占比{_up_down_pp(d_non)}。"
+                f"\n详见“收入分析”子页面。"
+            )
+        elif code == "SUM009":
+            # SUM009: directly reuse income-analysis 2.1.1 auto text, then add child composition trend.
+            n_gp = income_nodes.get("2.1.1", {}) if isinstance(income_nodes, dict) else {}
+            gp_auto = str(n_gp.get("auto_text", "") or "").strip()
+            comps = _build_gp_components()
+            abs_total_1 = sum(abs((c.get("values", {}) or {}).get(y1) or 0.0) for c in comps if (c.get("values", {}) or {}).get(y1) is not None)
+            abs_total_3 = sum(abs((c.get("values", {}) or {}).get(y3) or 0.0) for c in comps if (c.get("values", {}) or {}).get(y3) is not None)
+            bits: List[str] = []
+            for c in sorted(
+                comps,
+                key=lambda x: abs(((x.get("values", {}) or {}).get(y3) or 0.0)),
+                reverse=True,
+            ):
+                vals = c.get("values", {}) if isinstance(c.get("values"), dict) else {}
+                v1c = vals.get(y1)
+                v3c = vals.get(y3)
+                s1c = (abs(v1c) / abs_total_1 * 100.0) if (v1c is not None and abs_total_1 > 1e-12) else None
+                s3c = (abs(v3c) / abs_total_3 * 100.0) if (v3c is not None and abs_total_3 > 1e-12) else None
+                dc = (s3c - s1c) if (s3c is not None and s1c is not None) else None
+                bits.append(
+                    f"{c.get('name','')}：{y3}年毛利影响占比{_fmt_pct(s3c)}（{y1}年{_fmt_pct(s1c)}，{y1}-{y3}年{_up_down_pp(dc)}）"
+                )
+            trend_txt = "；".join(bits) if bits else "各子业务毛利结构趋势待补充"
+            rel_text = (
+                (gp_auto + "\n") if gp_auto else ""
+            ) + f"{y3}年各子业务毛利影响占比及结构变化：{trend_txt}。"
+        elif code == "SUM010":
+            # SUM010: split into 主营业务毛利收益 + 其他经常性收益 and describe structure trend.
+            gp_vals = _pick_income_node_value("2.1.1")
+            other_vals = {
+                y: ((values.get(y) or 0.0) - (gp_vals.get(y) or 0.0))
+                if (values.get(y) is not None or gp_vals.get(y) is not None)
+                else None
+                for y in years
+            }
+            gp_s1 = _ratio_pct(gp_vals.get(y1), values.get(y1))
+            gp_s3 = _ratio_pct(gp_vals.get(y3), values.get(y3))
+            ot_s1 = _ratio_pct(other_vals.get(y1), values.get(y1))
+            ot_s3 = _ratio_pct(other_vals.get(y3), values.get(y3))
+            d_gp = (gp_s3 - gp_s1) if (gp_s3 is not None and gp_s1 is not None) else None
+            d_ot = (ot_s3 - ot_s1) if (ot_s3 is not None and ot_s1 is not None) else None
+            rel_text = (
+                f"{y3}年经常性净收益中，主营业务毛利收益占比{_fmt_pct(gp_s3)}，其他经常性收益占比{_fmt_pct(ot_s3)}；"
+                f"{y1}-{y3}年，主营业务毛利收益占比{_up_down_pp(d_gp)}，其他经常性收益占比{_up_down_pp(d_ot)}。"
+                f"\n详见“收入分析”子页面。"
+            )
+        elif code == "SUM011":
+            rel_text = (
+                f"{y3}年{name}占经营净收益比例为{_fmt_pct(r3)}；"
+                f"{y1}-{y3}年占比{_up_down_pp((r3 - r1) if (r3 is not None and r1 is not None) else None)}。"
+                f"\n详见“收入分析”子页面。"
+            )
+        else:
+            rel_text = f"{name}：结构占比分析待补充。"
+
+        # Upgrade selected summary subjects with "Top composition + migration" narrative.
+        comps: List[Dict[str, Any]] = []
+        if code == "SUM001":
+            comps = _build_bs_components([(1, 26)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM001", set())))
+        elif code == "SUM002":
+            comps = _build_bs_components([(29, 55)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM002", set())))
+        elif code == "SUM003":
+            # Asset total: use two subtotal buckets only (流动资产合计 / 非流动资产合计).
+            c_cur = _pick_bs_value({"code_candidates": ["BS000", "BS027"]})
+            c_non = _pick_bs_value({"code_candidates": ["BS028", "BS056"]})
+            s_cur_3 = _ratio_pct(c_cur.get(y3), values.get(y3))
+            s_non_3 = _ratio_pct(c_non.get(y3), values.get(y3))
+            s_cur_1 = _ratio_pct(c_cur.get(y1), values.get(y1))
+            s_non_1 = _ratio_pct(c_non.get(y1), values.get(y1))
+            d_cur = (s_cur_3 - s_cur_1) if (s_cur_3 is not None and s_cur_1 is not None) else None
+            d_non = (s_non_3 - s_non_1) if (s_non_3 is not None and s_non_1 is not None) else None
+            rel_text = (
+                f"{y3}年流动资产合计占比{_fmt_pct(s_cur_3)}、非流动资产合计占比{_fmt_pct(s_non_3)}；"
+                f"{y1}-{y3}年，流动资产合计占比{_up_down_pp(d_cur)}；非流动资产合计占比{_up_down_pp(d_non)}。"
+            )
+        elif code == "SUM004":
+            comps = _build_bs_components([(59, 88)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM004", set())))
+        elif code == "SUM005":
+            comps = _build_bs_components([(91, 101)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM005", set())))
+        elif code == "SUM006":
+            # Liability total: use two subtotal buckets only (流动负债合计 / 非流动负债合计).
+            c_cur = _pick_bs_value({"code_candidates": ["BS058", "BS089"]})
+            c_non = _pick_bs_value({"code_candidates": ["BS090", "BS102"]})
+            s_cur_3 = _ratio_pct(c_cur.get(y3), values.get(y3))
+            s_non_3 = _ratio_pct(c_non.get(y3), values.get(y3))
+            s_cur_1 = _ratio_pct(c_cur.get(y1), values.get(y1))
+            s_non_1 = _ratio_pct(c_non.get(y1), values.get(y1))
+            d_cur = (s_cur_3 - s_cur_1) if (s_cur_3 is not None and s_cur_1 is not None) else None
+            d_non = (s_non_3 - s_non_1) if (s_non_3 is not None and s_non_1 is not None) else None
+            rel_text = (
+                f"{y3}年流动负债合计占比{_fmt_pct(s_cur_3)}、非流动负债合计占比{_fmt_pct(s_non_3)}；"
+                f"{y1}-{y3}年，流动负债合计占比{_up_down_pp(d_cur)}；非流动负债合计占比{_up_down_pp(d_non)}。"
+            )
+        elif code == "SUM007":
+            comps = _build_income_components()
+        if comps and code in {"SUM001", "SUM002", "SUM004", "SUM005", "SUM007"}:
+            target_pct = top_coverage_income if code == "SUM007" else top_coverage_default
+            rel_text = rel_text + "\n" + _top_migration_text(values, comps, coverage_target_pct=target_pct)
+
+        struct_rows.append(
+            {
+                "科目编码": code,
+                "科目名称": name,
+                y1: r1,
+                y2: r2,
+                y3: r3,
+                "定量描述_相对量": rel_text,
+            }
+        )
+
+    # analysis map with manual merge
+    store = load_store(project_id)
+    entries = store.get("entries", {})
+    analysis_rows: List[Dict[str, Any]] = []
+    scale_by_code = {str(r.get("科目编码", "")): r for r in scale_rows}
+    struct_by_code = {str(r.get("科目编码", "")): r for r in struct_rows}
+    for item in SUMMARY_ANALYSIS_ITEMS:
+        code = str(item["code"])
+        name = str(item["name"])
+        auto_abs = str(scale_by_code.get(code, {}).get("定量描述_绝对量", "") or "")
+        auto_rel = str(struct_by_code.get(code, {}).get("定量描述_相对量", "") or "")
+        auto_combined = auto_abs if not auto_rel else f"{auto_abs}\n{auto_rel}"
+        saved = entries.get(make_entry_key("summary_analysis", code), {})
+        manual_text = str(saved.get("manual_text", "") or "")
+        confirmed = bool(saved.get("confirmed", False))
+        analysis_rows.append(
+            {
+                "code": code,
+                "name": name,
+                "auto_abs": auto_abs,
+                "auto_rel": auto_rel,
+                "auto_combined": auto_combined,
+                "manual_text": manual_text,
+                "confirmed": confirmed,
+                "final_text": manual_text if manual_text.strip() else auto_combined,
+            }
+        )
+
+    headers_scale = ["科目编码", "科目名称"] + years + ["定量描述_绝对量"]
+    headers_struct = ["科目编码", "科目名称"] + years + ["定量描述_相对量"]
+    return {
+        "project_id": project_id,
+        "scale": {"sheet_title": "分析汇总_规模", "headers": headers_scale, "rows": scale_rows},
+        "structure": {"sheet_title": "分析汇总_结构", "headers": headers_struct, "rows": struct_rows},
+        "analysis": {"rows": analysis_rows},
+    }
+
+
 def load_store(project_id: str) -> Dict[str, Any]:
     p = store_path(project_id)
     if not p.exists():
@@ -1927,6 +3273,191 @@ def save_store(project_id: str, payload: Dict[str, Any]) -> None:
 
 def make_entry_key(group_id: str, code: str) -> str:
     return f"{group_id}:{code}"
+
+
+def make_value_override_key(group_id: str, code: str, year: str) -> str:
+    return f"{group_id}:{code}:{year}"
+
+
+def get_value_overrides(store: Dict[str, Any]) -> Dict[str, Any]:
+    raw = store.get("value_overrides", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def apply_value_overrides_to_rows(
+    rows: List[Dict[str, Any]],
+    years: List[str],
+    group_id: str,
+    project_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not project_id:
+        return rows
+    store = load_store(project_id)
+    overrides = get_value_overrides(store)
+    if not overrides:
+        return rows
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        code = str(r.get("code", "")).strip()
+        vals = dict(r.get("values", {})) if isinstance(r.get("values"), dict) else {}
+        changed_years: List[str] = []
+        for y in years:
+            k = make_value_override_key(group_id, code, str(y))
+            obj = overrides.get(k, {})
+            if isinstance(obj, dict) and obj.get("enabled", True) and obj.get("value") is not None:
+                vals[str(y)] = normalize_num(obj.get("value"))
+                changed_years.append(str(y))
+        nr = dict(r)
+        nr["values"] = vals
+        nr["override_years"] = changed_years
+        out.append(nr)
+    return out
+
+
+DEFAULT_VALIDATION_RULES = {
+    "bs": [
+        {
+            "rule_id": "BS_CORE_001",
+            "rule_name": "资产总计=流动资产合计+非流动资产合计",
+            "left_code": "BS057",
+            "operator": "SUM",
+            "right_codes": ["BS027", "BS056"],
+            "tolerance": 0.05,
+            "enabled": 1,
+        },
+        {
+            "rule_id": "BS_CORE_002",
+            "rule_name": "负债总计=流动负债合计+非流动负债合计",
+            "left_code": "BS103",
+            "operator": "SUM",
+            "right_codes": ["BS089", "BS102"],
+            "tolerance": 0.05,
+            "enabled": 1,
+        },
+    ],
+    "is": [],
+    "cf": [],
+}
+
+
+def load_validation_rules(group_id: str) -> List[Dict[str, Any]]:
+    gid = str(group_id or "").strip().lower()
+    defaults = list(DEFAULT_VALIDATION_RULES.get(gid, []))
+    if gid not in {"bs", "is", "cf"}:
+        return defaults
+    if not VALIDATION_RULEBOOK_PATH.exists():
+        return defaults
+    try:
+        wb = load_workbook(VALIDATION_RULEBOOK_PATH, data_only=True)
+    except Exception:
+        return defaults
+    ws = get_sheet_by_loose_name(wb, [f"{gid}_checks"])
+    if ws is None:
+        return defaults
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_rule_id = headers.get("rule_id", 1)
+    c_rule_name = headers.get("rule_name", headers.get("rule_desc", 2))
+    c_left = headers.get("left_code", 3)
+    c_op = headers.get("operator", 4)
+    c_right = headers.get("right_codes", headers.get("right_expr", 5))
+    c_tol = headers.get("tolerance", 6)
+    c_enabled = headers.get("enabled", 7)
+    out: List[Dict[str, Any]] = []
+    for r in range(2, ws.max_row + 1):
+        enabled_raw = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled_raw in {"0", "false", "no"}:
+            continue
+        left_code = str(ws.cell(r, c_left).value or "").strip().upper()
+        op = str(ws.cell(r, c_op).value or "SUM").strip().upper()
+        right_raw = str(ws.cell(r, c_right).value or "").strip()
+        if not left_code or not right_raw:
+            continue
+        right_codes = [x.strip().upper() for x in right_raw.replace(";", ",").split(",") if x.strip()]
+        if not right_codes:
+            continue
+        try:
+            tol = float(ws.cell(r, c_tol).value)
+        except Exception:
+            tol = 0.05
+        out.append(
+            {
+                "rule_id": str(ws.cell(r, c_rule_id).value or "").strip() or f"{gid.upper()}_{r}",
+                "rule_name": str(ws.cell(r, c_rule_name).value or "").strip() or left_code,
+                "left_code": left_code,
+                "operator": op,
+                "right_codes": right_codes,
+                "tolerance": tol,
+                "enabled": 1,
+            }
+        )
+    return out or defaults
+
+
+def build_validation_map(group_id: str, rows: List[Dict[str, Any]], years: List[str], tol: float = 0.05) -> Dict[str, Dict[str, Any]]:
+    by_code = {str(r.get("code", "")).strip().upper(): r for r in rows}
+
+    def _v(code: str, year: str) -> Optional[float]:
+        r = by_code.get(code, {})
+        vals = r.get("values", {}) if isinstance(r.get("values"), dict) else {}
+        return normalize_num(vals.get(year))
+
+    rules = load_validation_rules(group_id)
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for code in by_code.keys():
+        result[code] = {"status": "未配置", "message": "该行暂未配置校验规则"}
+
+    for rule in rules:
+        left = str(rule.get("left_code", "")).strip().upper()
+        op = str(rule.get("operator", "SUM")).strip().upper()
+        rights = [str(x).strip().upper() for x in (rule.get("right_codes", []) or []) if str(x).strip()]
+        rule_tol = float(rule.get("tolerance", tol))
+        if left not in by_code:
+            continue
+        failed: List[str] = []
+        for y in years:
+            lv = _v(left, y)
+            if lv is None:
+                failed.append(f"{y}待补充")
+                continue
+            rv = None
+            if op == "SUM":
+                rv_codes = [x.lstrip("+-") for x in rights if x.lstrip("+-") in by_code]
+                rv_list = [_v(x, y) for x in rv_codes]
+                if not rv_list:
+                    failed.append(f"{y}待补充")
+                    continue
+                rv = sum([x or 0.0 for x in rv_list])
+            elif op == "EXPR":
+                acc = 0.0
+                ok = True
+                for raw in rights:
+                    sign = -1.0 if str(raw).startswith("-") else 1.0
+                    code_part = str(raw)[1:] if str(raw).startswith(("+", "-")) else str(raw)
+                    if code_part not in by_code:
+                        ok = False
+                        break
+                    vv = _v(code_part, y)
+                    if vv is None:
+                        ok = False
+                        break
+                    acc += sign * vv
+                rv = acc if ok else None
+            if rv is None:
+                continue
+            diff = (lv or 0.0) - (rv or 0.0)
+            if abs(diff) > rule_tol:
+                failed.append(f"{y}差额{diff:.2f}")
+        if failed:
+            result[left] = {"status": "未通过", "message": "；".join(failed)}
+        else:
+            result[left] = {"status": "通过", "message": "核心勾稽已通过"}
+
+    return result
+
+
+def build_bs_validation_map(rows: List[Dict[str, Any]], years: List[str], tol: float = 0.05) -> Dict[str, Dict[str, Any]]:
+    return build_validation_map("bs", rows, years, tol=tol)
 
 
 def generate_auto_text(name: str, values: Dict[str, Optional[float]], years: List[str]) -> str:
@@ -1983,6 +3514,25 @@ def _get_rule_source(source_id: str) -> Optional[Dict[str, Any]]:
     return next((x for x in RULE_EDIT_SOURCES if str(x.get("source_id")) == sid), None)
 
 
+def _id_sort_key(v: Any) -> tuple:
+    s = str(v or "").strip()
+    m = re.match(r"^([A-Za-z_]+)_(\d+)$", s)
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (s, 0)
+
+
+def _validation_id_prefix(sheet_name: str) -> str:
+    s = str(sheet_name or "").strip().lower()
+    if s == "bs_checks":
+        return "BS_CHK"
+    if s == "is_checks":
+        return "IS_CHK"
+    if s == "cf_checks":
+        return "CF_CHK"
+    return "CHK"
+
+
 def _rule_catalog() -> List[Dict[str, Any]]:
     items = []
     for x in RULE_EDIT_SOURCES:
@@ -2000,6 +3550,8 @@ def _rule_catalog() -> List[Dict[str, Any]]:
 
 
 def _read_rule_sheet(source_id: str, sheet_name: str) -> Dict[str, Any]:
+    if source_id == "rulebook_main" and sheet_name in {"analysis_thresholds", "分析阈值配置"}:
+        return _read_analysis_thresholds_expanded(source_id, "analysis_thresholds")
     src = _get_rule_source(source_id)
     if not src:
         raise ValueError("unknown source_id")
@@ -2023,6 +3575,10 @@ def _read_rule_sheet(source_id: str, sheet_name: str) -> Dict[str, Any]:
             key = h or f"col_{i+1}"
             obj[key] = vals[i]
         rows.append(obj)
+    if source_id == "validation_rulebook":
+        key_name = "rule_id" if "rule_id" in headers else (headers[0] if headers else "")
+        if key_name:
+            rows.sort(key=lambda x: _id_sort_key(x.get(key_name)))
     return {
         "source_id": source_id,
         "sheet_name": ws.title,
@@ -2039,7 +3595,7 @@ def _validate_rule_rows(sheet_name: str, headers: List[str], rows: List[Dict[str
     threshold_keys = [
         h
         for h in headers
-        if h.lower() in {"threshold_value", "stable_threshold"}
+        if h.lower() in {"threshold_value", "stable_threshold", "tolerance"}
         or h.lower().endswith("_threshold")
         or h.lower().endswith("_threshold_pp")
     ]
@@ -2070,6 +3626,8 @@ def _validate_rule_rows(sheet_name: str, headers: List[str], rows: List[Dict[str
 
 
 def _save_rule_sheet(source_id: str, sheet_name: str, headers: List[str], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if source_id == "rulebook_main" and sheet_name in {"analysis_thresholds", "分析阈值配置"}:
+        return _save_analysis_thresholds_expanded(rows)
     src = _get_rule_source(source_id)
     if not src:
         raise ValueError("unknown source_id")
@@ -2084,6 +3642,28 @@ def _save_rule_sheet(source_id: str, sheet_name: str, headers: List[str], rows: 
     has_error = any(x.get("level") == "error" for x in issues)
     if has_error:
         return {"ok": False, "issues": issues, "saved_rows": 0, "path": str(p), "sheet_name": ws.title}
+
+    if source_id == "validation_rulebook":
+        id_key = "rule_id" if "rule_id" in headers else (headers[0] if headers else "")
+        if id_key:
+            prefix = _validation_id_prefix(sheet_name)
+            used_nums = set()
+            for r in rows:
+                rid = str(r.get(id_key, "")).strip()
+                m = re.match(rf"^{re.escape(prefix)}_(\d+)$", rid)
+                if m:
+                    used_nums.add(int(m.group(1)))
+            nxt = 1
+            for r in rows:
+                rid = str(r.get(id_key, "")).strip()
+                if rid:
+                    continue
+                while nxt in used_nums:
+                    nxt += 1
+                r[id_key] = f"{prefix}_{nxt:03d}"
+                used_nums.add(nxt)
+                nxt += 1
+            rows.sort(key=lambda x: _id_sort_key(x.get(id_key)))
 
     # Rewrite body rows while preserving header row.
     body_start = 2
@@ -2107,6 +3687,7 @@ def render_index() -> str:
     analysis_cards = (
         '<a class="card" href="/analysis/assets"><h3>资产分析</h3><p>查看规模变化与结构占比</p></a>'
         '<a class="card" href="/analysis/liabilities"><h3>负债分析</h3><p>查看规模变化与结构占比</p></a>'
+        '<a class="card" href="/analysis/summary"><h3>分析汇总</h3><p>汇总科目综合描述与确认</p></a>'
         '<a class="card" href="/analysis/income"><h3>收入分析</h3><p>经常性/非经常性收益拆分</p></a>'
         '<a class="card" href="/analysis/ratios"><h3>财务指标分析</h3><p>指标趋势、判断与确认</p></a>'
         '<a class="card" href="/analysis/key-ratios"><h3>重要指标分析</h3><p>ROE与毛利率深度分析</p></a>'
@@ -2181,6 +3762,111 @@ document.getElementById('plist').addEventListener('change', () => {{
 }});
 document.getElementById('pid').addEventListener('input', rewriteLinks);
 rewriteLinks();
+</script>
+</body>
+</html>"""
+
+
+def render_thresholds_page() -> str:
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>阈值配置</title>
+  <style>
+    :root { --bg:#f5f7fa; --card:#fff; --ink:#111827; --line:#d1d5db; --muted:#6b7280; --acc:#0f766e; }
+    body { margin:0; font-family:"Microsoft YaHei","PingFang SC",sans-serif; background:var(--bg); color:var(--ink); }
+    .top { position:sticky; top:0; background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .btn { border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 10px; text-decoration:none; color:inherit; cursor:pointer; }
+    .btn.primary { background:var(--acc); color:#fff; border-color:var(--acc); }
+    .wrap { padding:12px 16px 24px; display:grid; grid-template-columns:320px 1fr; gap:12px; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .panel h3 { margin:0; padding:10px 12px; border-bottom:1px solid var(--line); background:#fafafa; font-size:14px; }
+    .body { padding:10px 12px; }
+    .muted { color:var(--muted); font-size:12px; }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:8px; }
+    table { width:100%; min-width:760px; border-collapse:collapse; }
+    th, td { border-bottom:1px solid #eef2f7; padding:6px 8px; font-size:12px; text-align:left; }
+    th { position:sticky; top:0; background:#f9fafb; }
+    input[type=\"number\"] { width:120px; padding:4px 6px; }
+    .ok { color:#065f46; font-weight:600; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a class="btn" href="/">返回主页</a>
+    <strong>阈值配置（两级）</strong>
+    <span class="muted" id="status">加载中...</span>
+    <button class="btn" onclick="reloadAll()">刷新</button>
+    <button class="btn primary" onclick="saveAll()">保存阈值</button>
+  </div>
+  <div class="wrap">
+    <div class="panel">
+      <h3>全局阈值</h3>
+      <div class="body">
+        <div class="muted">未设置科目阈值时，默认使用全局阈值。</div>
+        <div style="margin-top:8px;">
+          <label>稳定阈值（%）：</label>
+          <input id="globalPct" type="number" step="0.01"/>
+        </div>
+      </div>
+      <h3>说明</h3>
+      <div class="body">
+        <div class="muted">调用顺序：科目阈值优先；否则使用全局阈值。</div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>科目阈值（可选）</h3>
+      <div class="body">
+        <input id="kw" placeholder="搜索编码/科目名" style="width:260px;padding:6px;" oninput="renderTable()"/>
+        <div class="table-wrap" style="margin-top:8px;">
+          <table id="tbl"></table>
+        </div>
+      </div>
+    </div>
+  </div>
+<script>
+let rows = [];
+function esc(s){ return (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
+function setStatus(t, ok=false){ const el=document.getElementById('status'); el.textContent=t||''; el.className=ok?'ok':'muted'; }
+function renderTable(){
+  const kw = (document.getElementById('kw').value || '').trim().toLowerCase();
+  const rs = !kw ? rows : rows.filter(r => String(r.code).toLowerCase().includes(kw) || String(r.name).toLowerCase().includes(kw));
+  const head = '<tr><th>启用</th><th>科目编码</th><th>科目名称</th><th>阈值(%)</th></tr>';
+  const body = rs.map((r, i) => `
+    <tr data-code="${esc(r.code)}">
+      <td><input type="checkbox" ${r.enabled?'checked':''} onchange="onToggle('${esc(r.code)}', this.checked)"/></td>
+      <td>${esc(r.code)}</td>
+      <td>${esc(r.name)}</td>
+      <td><input type="number" step="0.01" value="${esc(r.threshold_pct)}" oninput="onValue('${esc(r.code)}', this.value)"/></td>
+    </tr>`).join('');
+  document.getElementById('tbl').innerHTML = head + body;
+}
+function onToggle(code, v){ const r=rows.find(x=>x.code===code); if(r) r.enabled=!!v; }
+function onValue(code, v){ const r=rows.find(x=>x.code===code); if(r) r.threshold_pct=v; }
+async function reloadAll(){
+  setStatus('读取中...');
+  const res = await fetch('/api/thresholds');
+  const data = await res.json();
+  if(!res.ok){ setStatus(data.error || '读取失败'); return; }
+  document.getElementById('globalPct').value = data.global_pct ?? 2.0;
+  rows = data.rows || [];
+  renderTable();
+  setStatus(`已加载 ${rows.length} 个科目`);
+}
+async function saveAll(){
+  const gp = Number(document.getElementById('globalPct').value || '0');
+  if(!Number.isFinite(gp)){ setStatus('全局阈值格式错误'); return; }
+  const payload = { global_pct: gp, rows };
+  setStatus('保存中...');
+  const res = await fetch('/api/thresholds/save', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  const data = await res.json();
+  if(!res.ok || !data.ok){ setStatus(data.error || '保存失败'); return; }
+  setStatus(`保存成功：科目阈值 ${data.saved_subject_rows} 条`, true);
+  await reloadAll();
+}
+reloadAll();
 </script>
 </body>
 </html>"""
@@ -2263,6 +3949,10 @@ let headers = [];
 let rows = [];
 let sourceId = '';
 let sheetName = '';
+const DEFAULT_SHEET_BY_SOURCE = {
+  income_rulebook: 'trend_thresholds',
+  validation_rulebook: 'bs_checks'
+};
 const ZH_NAME_MAP = {
   // 资产负债分析模板
   'asset_abs': '资产绝对量描述',
@@ -2284,6 +3974,22 @@ const ZH_NAME_MAP = {
   'income_segment_share': '收入分项占比描述',
   'gross_segment_value': '毛利分项金额描述',
   'gross_segment_impact': '毛利分项贡献描述',
+  'gross_contribution_basis': '毛利贡献口径说明',
+  'gross_segment_net_attr': '毛利净归因描述',
+  'gross_segment_dual_view': '毛利双口径摘要',
+  'gross_segment_scenario_judgement': '毛利场景定性描述',
+  'profit_summary_header_missing': '利润汇总头句-缺失',
+  'profit_summary_header_positive': '利润汇总头句-正值',
+  'profit_summary_header_zero': '利润汇总头句-为零',
+  'profit_summary_header_negative': '利润汇总头句-负值',
+  'profit_summary_line_positive': '利润汇总分项句-正值',
+  'profit_summary_line_negative': '利润汇总分项句-负值',
+  'profit_summary_line_zero': '利润汇总分项句-零值',
+  'gp_share_mode': '毛利贡献占比口径',
+  'impact_ratio_label': '影响占比标签',
+  'algebraic_ratio_label': '代数占比标签',
+  'basis_impact_text': '影响口径说明词',
+  'basis_algebraic_text': '代数口径说明词',
   // 常规指标模板
   'indicator_value': '指标数值描述',
   'indicator_trend': '指标趋势描述',
@@ -2322,10 +4028,118 @@ const ZH_NAME_MAP = {
   'structure_effect': '效应分解',
   'negative_case': '负值场景'
 };
+const SOURCE_ZH_MAP = {
+  'rulebook_main': '资产负债分析规则',
+  'ratio_rulebook': '财务指标规则',
+  'income_rulebook': '收入利润规则',
+  'key_ratio_rulebook': '重点指标规则',
+  'validation_rulebook': '报表校验规则'
+};
+const SHEET_ZH_MAP = {
+  // income profit rulebook
+  'scope_catalog': '范围目录',
+  'metric_definitions': '指标定义',
+  'trend_thresholds': '趋势阈值',
+  'sign_scenario_policy': '正负场景策略',
+  'contribution_policy': '贡献口径策略',
+  'display_fields': '展示字段',
+  'text_templates': '文本模板',
+  'node_mapping': '节点映射',
+  'manual_override': '人工覆盖策略',
+  'income_special_items': '收入特殊项映射',
+  'income_grouping': '收入分组',
+  'income_tree': '收入分析树',
+  'income_formulas': '收入汇总公式',
+  // other common sheets
+  'analysis_text_templates': '分析文本模板',
+  'analysis_thresholds': '分析阈值配置',
+  'bs_checks': '资产负债校验规则',
+  'is_checks': '利润表校验规则',
+  'cf_checks': '现金流量表校验规则',
+  'display_policy': '展示策略',
+  'driver_thresholds': '驱动阈值',
+  'narrative_templates': '叙述模板'
+};
+const FIELD_ZH_MAP = {
+  'tpl_id': '模板ID',
+  'template_id': '模板ID',
+  'scene': '场景',
+  'template_key': '模板键',
+  'template_text': '模板文本',
+  'template_text_zh': '模板文本',
+  'variables': '变量清单',
+  'placeholders': '占位符声明',
+  'enabled': '启用',
+  'notes': '备注',
+  'description': '说明',
+  'rule_id': '规则ID',
+  'rule_name': '规则名称',
+  'left_code': '左值编码',
+  'operator': '运算符',
+  'right_codes': '右值编码集',
+  'tolerance': '容差',
+  'severity': '严重级别',
+  'stable_threshold': '稳定阈值',
+  'stable_threshold_pct': '稳定阈值(%)',
+  'scale_stable_pct': '绝对量稳定阈值(%)',
+  'struct_stable_pp': '结构稳定阈值(百分点)',
+  'threshold_unit': '阈值单位',
+  'threshold_key': '阈值键',
+  'threshold_value': '阈值值',
+  'up_label': '上行表述词',
+  'down_label': '下行表述词',
+  'stable_label': '稳定表述词',
+  'direction_label_pos': '正向表述词',
+  'direction_label_neg': '负向表述词',
+  'metric_id': '指标ID',
+  'metric_name_zh': '指标名称',
+  'rule_id': '规则ID',
+  'policy_id': '策略ID',
+  'condition_expr': '条件表达式',
+  'primary_ratio_metric': '主口径指标',
+  'scope': '范围',
+  'subject_code': '科目编码',
+  'subject_name': '科目名称',
+  'key': '键',
+  'value': '值',
+  'field': '字段',
+  'desc_zh': '中文说明',
+  'sort_order': '排序',
+  'unit': '单位',
+  'direction': '方向'
+};
+const METRIC_ZH_MAP = {
+  'rev_yoy': '收入同比变动',
+  'rev_share': '收入占比变动',
+  'gp_value': '毛利金额变动',
+  'gp_share_impact': '毛利贡献占比变动',
+  'gp_share_algebraic': '毛利代数占比'
+};
+const RULE_ZH_MAP = {
+  'TR_REV_YOY': '收入同比趋势规则',
+  'TR_REV_SHARE': '收入占比趋势规则',
+  'TR_GP_YOY': '毛利金额趋势规则',
+  'TR_GP_SHARE_IMPACT': '毛利贡献趋势规则'
+};
+const POLICY_ZH_MAP = {
+  'SCN1': '同号且整体盈利场景',
+  'SCN2': '异号且整体盈利场景',
+  'SCN3': '同号且整体亏损场景',
+  'SCN4': '异号且整体亏损场景',
+  'SCN5': '整体为零场景'
+};
 
 function esc(s){ return (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function setStatus(t){ document.getElementById('status').textContent = t || ''; }
 function currentSource(){ return catalog.find(x => x.source_id === sourceId) || null; }
+function sourceLabelById(id){
+  const src = catalog.find(x => x.source_id === id);
+  if (!src) return id || '';
+  return SOURCE_ZH_MAP[id] || src.label || id;
+}
+function sheetLabelByName(name){
+  return SHEET_ZH_MAP[name] || name || '';
+}
 function keyField(){
   const candidates = ['template_key','template_id','scene','threshold_key','metric_id','key'];
   return candidates.find(k => headers.includes(k)) || '';
@@ -2343,6 +4157,14 @@ function zhNameForRow(row){
   const kf = keyField();
   const keyVal = (row && kf) ? String(row[kf] ?? '').trim() : '';
   if (keyVal && ZH_NAME_MAP[keyVal]) return ZH_NAME_MAP[keyVal];
+  const rid = String(row?.rule_id ?? '').trim();
+  if (rid && RULE_ZH_MAP[rid]) return RULE_ZH_MAP[rid];
+  const mid = String(row?.metric_id ?? '').trim();
+  if (mid && METRIC_ZH_MAP[mid]) return METRIC_ZH_MAP[mid];
+  const pid = String(row?.policy_id ?? '').trim();
+  if (pid && POLICY_ZH_MAP[pid]) return POLICY_ZH_MAP[pid];
+  const scn = String(row?.scenario ?? '').trim();
+  if (scn) return scn;
   // fallback: notes/description 可作为辅助中文说明
   const note = String((row?.notes ?? row?.description ?? '') || '').trim();
   return note || '';
@@ -2359,10 +4181,14 @@ function asInput(k, v){
   return `<input data-key="${esc(k)}" value="${esc(t)}"/>`;
 }
 function renderTable(){
-  const title = `${sourceId} / ${sheetName}`;
+  const title = `${sourceLabelById(sourceId)} / ${sheetLabelByName(sheetName)}`;
   document.getElementById('tableTitle').textContent = title;
   const dHeaders = displayHeaders();
-  const th = `<tr>${dHeaders.map(h => `<th>${esc(h === '__zh_name' ? '中文名称' : h)}</th>`).join('')}</tr>`;
+  const th = `<tr>${dHeaders.map(h => {
+    if (h === '__zh_name') return '<th>中文名称</th>';
+    const label = FIELD_ZH_MAP[h] || h;
+    return `<th>${esc(label)}</th>`;
+  }).join('')}</tr>`;
   const trs = rows.map((r, i) => {
     const tds = dHeaders.map(h => {
       if (h === '__zh_name') return `<td class="muted">${esc(zhNameForRow(r))}</td>`;
@@ -2386,16 +4212,22 @@ function collectRows(){
 }
 function renderSourceSheetOptions(){
   const srcSel = document.getElementById('sourceSel');
-  srcSel.innerHTML = catalog.map(x => `<option value="${esc(x.source_id)}">${esc(x.label)}${x.exists?'':' (文件不存在)'}</option>`).join('');
+  srcSel.innerHTML = catalog.map(x => {
+    const label = sourceLabelById(x.source_id);
+    return `<option value="${esc(x.source_id)}">${esc(label)}${x.exists?'':'（文件不存在）'}</option>`;
+  }).join('');
   if (!sourceId && catalog.length) sourceId = catalog[0].source_id;
   srcSel.value = sourceId;
   const src = currentSource();
   const sheetSel = document.getElementById('sheetSel');
   const sheets = src ? (src.sheets || []) : [];
-  sheetSel.innerHTML = sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
-  if (!sheetName && sheets.length) sheetName = sheets[0];
+  sheetSel.innerHTML = sheets.map(s => `<option value="${esc(s)}">${esc(sheetLabelByName(s))}</option>`).join('');
+  if ((!sheetName || !sheets.includes(sheetName)) && sheets.length){
+    const prefer = DEFAULT_SHEET_BY_SOURCE[sourceId];
+    sheetName = (prefer && sheets.includes(prefer)) ? prefer : sheets[0];
+  }
   sheetSel.value = sheetName;
-  document.getElementById('sourcePath').textContent = src ? (`${src.path}`) : '';
+  document.getElementById('sourcePath').textContent = src ? ('规则已接入配置中心（无需手动改Excel路径）') : '';
 }
 async function loadCatalog(){
   const res = await fetch('/api/rules/catalog');
@@ -2669,6 +4501,16 @@ def render_liability_analysis_page(project_id: str) -> str:
     )
 
 
+def render_summary_analysis_page(project_id: str) -> str:
+    return render_analysis_page(
+        project_id=project_id,
+        title="分析汇总",
+        api_path="/api/analysis/summary",
+        save_group_id="summary_analysis",
+        subject_label="汇总科目",
+    )
+
+
 def render_income_analysis_page(project_id: str) -> str:
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2719,6 +4561,13 @@ def render_income_analysis_page(project_id: str) -> str:
         <h3>分析判断内容（可编辑）</h3>
         <div class="desc"><textarea id="manualText"></textarea></div>
         <div class="toolbar">
+          <label id="classBucketWrap" style="display:inline-flex;">归类确认
+            <select id="classBucket">
+              <option value="recurring">经常性净收益</option>
+              <option value="nonrecurring">非经常性净收益</option>
+            </select>
+          </label>
+          <span id="classBucketHint" class="muted" style="display:inline-flex;">仅对当前项目生效</span>
           <label><input type="checkbox" id="manualConfirmed"> 确认</label>
           <button class="btn primary" onclick="saveActive()">保存并确认</button>
           <span id="saveHint" class="muted"></span>
@@ -2759,9 +4608,23 @@ function renderNode() {{
   renderTree();
   const n = nodeById(activeNodeId);
   if (!n) return;
+  const nodeId = String(n.node_id || '');
+  const canClassify = (!!n.classification_editable) || nodeId.startsWith('2.1.2.') || nodeId.startsWith('2.2.');
+  const fallbackBucket = nodeId.startsWith('2.1.2.') ? 'recurring' : 'nonrecurring';
   document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析）`;
   document.getElementById('autoText').textContent = n.auto_text || '';
   document.getElementById('manualText').value = n.manual_text || n.auto_text || '';
+  const clsSel = document.getElementById('classBucket');
+  const clsHint = document.getElementById('classBucketHint');
+  if (canClassify) {{
+    clsSel.disabled = false;
+    clsHint.textContent = '仅对当前项目生效';
+    clsSel.value = (n.classification_bucket || fallbackBucket);
+  }} else {{
+    clsSel.disabled = true;
+    clsHint.textContent = '当前节点无需归类';
+    clsSel.value = fallbackBucket;
+  }}
   document.getElementById('manualConfirmed').checked = !!n.confirmed;
   document.getElementById('saveHint').textContent = n.confirmed ? '当前已确认' : '';
 }}
@@ -2775,7 +4638,9 @@ async function saveActive() {{
       code: n.node_id,
       name: n.label,
       manual_text: document.getElementById('manualText').value,
-      confirmed: document.getElementById('manualConfirmed').checked
+      confirmed: document.getElementById('manualConfirmed').checked,
+      classification_bucket: (String(n.node_id || '').startsWith('2.1.2.') || String(n.node_id || '').startsWith('2.2.') || !!n.classification_editable)
+        ? document.getElementById('classBucket').value : ''
     }}]
   }};
   const res = await fetch('/api/save', {{
@@ -3167,6 +5032,11 @@ def render_sheet_page(group: Dict[str, Any], project_id: str) -> str:
     td.num {{ text-align:right; white-space:nowrap; }}
     textarea {{ width:100%; min-height:76px; resize:vertical; font:inherit; }}
     .pill {{ display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 8px; font-size:12px; }}
+    .ok {{ background:#ecfdf5; border-color:#86efac; color:#166534; }}
+    .bad {{ background:#fef2f2; border-color:#fca5a5; color:#991b1b; }}
+    .na {{ background:#f8fafc; border-color:#cbd5e1; color:#475569; }}
+    input.num-edit {{ width:120px; text-align:right; }}
+    input.reason-edit {{ width:220px; }}
     .dirty {{ background:#fff7ed; }}
   </style>
 </head>
@@ -3191,7 +5061,7 @@ def render_sheet_page(group: Dict[str, Any], project_id: str) -> str:
 const PROJECT_ID = {json.dumps(project_id)};
 const GROUP_ID = {json.dumps(gid)};
 let cache = null;
-if (GROUP_ID === 'bs') {{
+if (GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf') {{
   const btn = document.getElementById('saveBtn');
   if (btn) btn.textContent = '保存确认';
 }}
@@ -3219,19 +5089,32 @@ async function reloadData() {{
 function render() {{
   const years = cache.years || [];
   document.getElementById('status').textContent = `行数 ${{cache.rows.length}}` + (cache.sheet_title ? ` | 来源Sheet: ${{cache.sheet_title}}` : '');
-  const head = GROUP_ID === 'bs'
-    ? `<tr><th style="min-width:90px;">科目编码</th><th style="min-width:180px;">科目</th>${{years.map(y=>`<th>${{y}}</th>`).join('')}}<th style="min-width:460px;">分析判断内容</th><th>确认</th></tr>`
+  const head = (GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf')
+    ? `<tr><th style="min-width:90px;">科目编码</th><th style="min-width:180px;">科目</th>${{years.map(y=>`<th>${{y}}</th>`).join('')}}<th style="min-width:460px;">分析判断内容</th><th style="min-width:220px;">数据校验</th><th style="min-width:220px;">修改原因</th><th style="min-width:120px;">操作</th><th>确认</th></tr>`
     : `<tr><th style="min-width:90px;">科目编码</th><th style="min-width:180px;">科目</th>${{years.map(y=>`<th>${{y}}</th>`).join('')}}<th style="min-width:280px;">自动描述</th><th style="min-width:340px;">人工确认描述</th><th>确认</th></tr>`;
   document.getElementById('thead').innerHTML = head;
 
   const rowsHtml = cache.rows.map((r, idx) => {{
-    const vals = years.map(y => `<td class="num">${{r.values[y] == null ? '' : Number(r.values[y]).toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})}}</td>`).join('');
-    if (GROUP_ID === 'bs') {{
+    const vals = years.map(y => {{
+      const v = r.values[y];
+      if (GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf') {{
+        const txt = (v == null || Number.isNaN(Number(v))) ? '' : Number(v).toFixed(2);
+        return `<td class="num"><input class="num-edit" data-year="${{esc(y)}}" value="${{esc(txt)}}" oninput="markDirty(this)"/></td>`;
+      }}
+      return `<td class="num">${{v == null ? '' : Number(v).toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}})}}</td>`;
+    }}).join('');
+    if (GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf') {{
+      const st = String(r.validation_status || '未配置');
+      const cls = st === '通过' ? 'ok' : (st === '未通过' ? 'bad' : 'na');
+      const analysisText = GROUP_ID === 'bs' ? (r.analysis_text || '') : (r.auto_text || '');
       return `<tr data-i="${{idx}}">
         <td>${{esc(r.code)}}</td>
         <td>${{esc(r.name)}}</td>
         ${{vals}}
-        <td>${{esc(r.analysis_text || '')}}</td>
+        <td>${{esc(analysisText)}}</td>
+        <td><span class="pill ${{cls}}">${{esc(st)}}</span><div class="muted">${{esc(r.validation_message || '')}}</div></td>
+        <td><input class="reason-edit" placeholder="修改原因（必填）" value="${{esc(r.override_reason || '')}}" oninput="markDirty(this)"/></td>
+        <td><button class="btn" onclick="saveOneRow(${{idx}})">保存本行</button></td>
         <td><label class="pill"><input type="checkbox" ${{r.confirmed ? 'checked' : ''}} onchange="markDirty(this)">确认</label></td>
       </tr>`;
     }}
@@ -3254,7 +5137,24 @@ async function saveAll() {{
     const i = Number(tr.dataset.i);
     const base = cache.rows[i];
     const confirmed = tr.querySelector('input[type="checkbox"]').checked;
-    const txt = GROUP_ID === 'bs' ? '' : tr.querySelector('textarea').value;
+    if (GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf') {{
+      const values = Object.assign({{}}, base.values || {{}});
+      years.forEach(y => {{
+        const el = tr.querySelector(`input.num-edit[data-year="${{y}}"]`);
+        const raw = el ? String(el.value || '').trim() : '';
+        values[y] = raw === '' ? null : Number(raw);
+      }});
+      const reasonEl = tr.querySelector('input.reason-edit');
+      return {{
+        code: base.code,
+        name: base.name,
+        years,
+        values,
+        override_reason: reasonEl ? reasonEl.value : '',
+        confirmed
+      }};
+    }}
+    const txt = tr.querySelector('textarea').value;
     return {{
       code: base.code,
       name: base.name,
@@ -3276,6 +5176,42 @@ async function saveAll() {{
   if (data.ok) {{
     document.querySelectorAll('#tbody tr').forEach(x => x.classList.remove('dirty'));
   }}
+}}
+
+async function saveOneRow(idx) {{
+  if (!(GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf')) return;
+  if (!cache) return;
+  const tr = document.querySelector(`#tbody tr[data-i="${{idx}}"]`);
+  if (!tr) return;
+  const base = cache.rows[idx];
+  const years = cache.years || [];
+  const values = Object.assign({{}}, base.values || {{}});
+  years.forEach(y => {{
+    const el = tr.querySelector(`input.num-edit[data-year="${{y}}"]`);
+    const raw = el ? String(el.value || '').trim() : '';
+    values[y] = raw === '' ? null : Number(raw);
+  }});
+  const reasonEl = tr.querySelector('input.reason-edit');
+  const payload = {{
+    project_id: PROJECT_ID,
+    group_id: GROUP_ID,
+    rows: [{{
+      code: base.code,
+      name: base.name,
+      years,
+      values,
+      override_reason: reasonEl ? reasonEl.value : '',
+      confirmed: tr.querySelector('input[type="checkbox"]').checked
+    }}]
+  }};
+  const res = await fetch('/api/save', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify(payload)
+  }});
+  const data = await res.json();
+  document.getElementById('status').textContent = data.ok ? `已保存 1 行` : (`保存失败: ` + (data.error || 'unknown'));
+  if (data.ok) await reloadData();
 }}
 
 reloadData();
@@ -3342,6 +5278,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_html(render_liability_analysis_page(self._project_id(qs)))
             return
 
+        if path == "/analysis/summary":
+            self._send_html(render_summary_analysis_page(self._project_id(qs)))
+            return
+
         if path == "/analysis/income":
             self._send_html(render_income_analysis_page(self._project_id(qs)))
             return
@@ -3352,6 +5292,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/analysis/key-ratios":
             self._send_html(render_key_ratio_analysis_page(self._project_id(qs)))
+            return
+
+        if path == "/thresholds":
+            self._send_html(render_thresholds_page())
             return
 
         if path == "/rules":
@@ -3372,7 +5316,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
 
             wb = load_workbook(wb_path, data_only=False)
-            sheet_data = read_sheet_rows(wb, group)
+            sheet_data = read_sheet_rows(wb, group, project_id=project_id)
             years = sheet_data["years"]
             rows = sheet_data["rows"]
             asset_analysis_map = build_asset_analysis_map(wb, project_id) if group_id == "bs" else {}
@@ -3380,6 +5324,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
             store = load_store(project_id)
             entries = store.get("entries", {})
+            value_overrides = get_value_overrides(store)
+            vmap = build_validation_map(group_id, rows, years) if group_id in {"bs", "is", "cf"} else {}
             for r in rows:
                 key = make_entry_key(group_id, r["code"])
                 saved = entries.get(key, {})
@@ -3390,6 +5336,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     code = str(r["code"])
                     a = asset_analysis_map.get(code) or liability_analysis_map.get(code) or {}
                     r["analysis_text"] = str(a.get("final_text", "") or "")
+                if group_id in {"bs", "is", "cf"}:
+                    code = str(r["code"])
+                    chk = vmap.get(str(code).strip().upper(), {"status": "未配置", "message": "该行暂未配置校验规则"})
+                    r["validation_status"] = str(chk.get("status", "未配置"))
+                    r["validation_message"] = str(chk.get("message", ""))
+                    reason = ""
+                    for y in years:
+                        ov = value_overrides.get(make_value_override_key(group_id, code, str(y)), {})
+                        if isinstance(ov, dict) and str(ov.get("reason", "")).strip():
+                            reason = str(ov.get("reason", "")).strip()
+                            break
+                    r["override_reason"] = reason
 
             self._send_json(
                 {
@@ -3448,6 +5406,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     },
                 }
             )
+            return
+
+        if path == "/api/analysis/summary":
+            project_id = self._project_id(qs)
+            wb_path = workbook_path(project_id)
+            if not wb_path.exists():
+                self._send_json({"error": f"workbook not found: {wb_path}"}, status=404)
+                return
+            wb = load_workbook(wb_path, data_only=False)
+            payload = build_summary_analysis_payload(wb, project_id)
+            payload["workbook"] = str(wb_path)
+            self._send_json(payload)
             return
 
         if path == "/api/analysis/income":
@@ -3541,6 +5511,40 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, status=400)
             return
 
+        if path == "/api/thresholds":
+            cfg = _read_threshold_config()
+            catalog = _load_bs_code_name_catalog()
+            subj_scale = cfg.get("subject_scale_pct", {}) if isinstance(cfg.get("subject_scale_pct"), dict) else {}
+            subj_struct = cfg.get("subject_struct_pp", {}) if isinstance(cfg.get("subject_struct_pp"), dict) else {}
+            rows = []
+            for x in catalog:
+                code = str(x.get("code", ""))
+                vs = subj_scale.get(code)
+                vt = subj_struct.get(code)
+                rows.append(
+                    {
+                        "code": code,
+                        "name": str(x.get("name", "")),
+                        "enabled": (vs is not None) or (vt is not None),
+                        "scale_threshold_pct": vs if vs is not None else cfg.get("global_scale_pct", cfg.get("global_pct", 2.0)),
+                        "struct_threshold_pp": vt if vt is not None else cfg.get("global_struct_pp", cfg.get("global_pct", 2.0)),
+                        # backward compatibility fields
+                        "threshold_pct": vs if vs is not None else cfg.get("global_scale_pct", cfg.get("global_pct", 2.0)),
+                    }
+                )
+            self._send_json(
+                {
+                    "global_scale_pct": cfg.get("global_scale_pct", cfg.get("global_pct", 2.0)),
+                    "global_struct_pp": cfg.get("global_struct_pp", cfg.get("global_pct", 2.0)),
+                    "summary_top_coverage_default": cfg.get("summary_top_coverage_default", float(SUMMARY_TOP_COVERAGE_TARGET_PCT)),
+                    "summary_top_coverage_income": cfg.get("summary_top_coverage_income", float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME)),
+                    # backward compatibility field
+                    "global_pct": cfg.get("global_scale_pct", cfg.get("global_pct", 2.0)),
+                    "rows": rows,
+                }
+            )
+            return
+
         if path == "/api/projects":
             self._send_json({"projects": list_projects()})
             return
@@ -3549,7 +5553,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path not in {"/api/save", "/api/rules/save"}:
+        if parsed.path not in {"/api/save", "/api/rules/save", "/api/thresholds/save"}:
             self._send_json({"error": "not found"}, status=404)
             return
 
@@ -3581,6 +5585,43 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": str(e)}, status=400)
             return
 
+        if parsed.path == "/api/thresholds/save":
+            try:
+                global_scale_pct = float(body.get("global_scale_pct", body.get("global_pct")))
+            except Exception:
+                self._send_json({"ok": False, "error": "invalid global_scale_pct"}, status=400)
+                return
+            try:
+                global_struct_pp = float(body.get("global_struct_pp", global_scale_pct))
+            except Exception:
+                global_struct_pp = global_scale_pct
+            rows = body.get("rows", [])
+            if not isinstance(rows, list):
+                self._send_json({"ok": False, "error": "rows must be list"}, status=400)
+                return
+            result = _save_threshold_config(
+                global_scale_pct=global_scale_pct,
+                global_struct_pp=global_struct_pp,
+                subject_rows=rows,
+                summary_top_coverage_default=float(
+                    body.get(
+                        "summary_top_coverage_default",
+                        _read_threshold_config().get("summary_top_coverage_default", float(SUMMARY_TOP_COVERAGE_TARGET_PCT)),
+                    )
+                ),
+                summary_top_coverage_income=float(
+                    body.get(
+                        "summary_top_coverage_income",
+                        _read_threshold_config().get("summary_top_coverage_income", float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME)),
+                    )
+                ),
+            )
+            if not result.get("ok"):
+                self._send_json(result, status=400)
+                return
+            self._send_json(result)
+            return
+
         project_id = normalize_project_id(str(body.get("project_id", DEFAULT_PROJECT_ID)))
         group_id = str(body.get("group_id", "")).strip()
         rows = body.get("rows", [])
@@ -3590,6 +5631,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
         store = load_store(project_id)
         entries = store.setdefault("entries", {})
+        value_overrides = store.setdefault("value_overrides", {})
+        if not isinstance(value_overrides, dict):
+            value_overrides = {}
+            store["value_overrides"] = value_overrides
         now = datetime.now().isoformat(timespec="seconds")
         saved = 0
 
@@ -3598,13 +5643,42 @@ class AppHandler(BaseHTTPRequestHandler):
             if not code:
                 continue
             key = make_entry_key(group_id, code)
-            entries[key] = {
-                "code": code,
-                "name": str(r.get("name", "")).strip(),
-                "manual_text": str(r.get("manual_text", "")).strip(),
-                "confirmed": bool(r.get("confirmed", False)),
-                "updated_at": now,
-            }
+            if group_id in {"bs", "is", "cf"}:
+                yrs = [str(x) for x in (r.get("years", []) if isinstance(r.get("years", []), list) else [])]
+                vals = r.get("values", {}) if isinstance(r.get("values"), dict) else {}
+                reason = str(r.get("override_reason", "")).strip()
+                for y in yrs:
+                    vk = make_value_override_key(group_id, code, y)
+                    new_v = normalize_num(vals.get(y))
+                    if new_v is None:
+                        value_overrides.pop(vk, None)
+                        continue
+                    value_overrides[vk] = {
+                        "group_id": group_id,
+                        "code": code,
+                        "year": y,
+                        "value": new_v,
+                        "reason": reason,
+                        "enabled": True,
+                        "updated_at": now,
+                    }
+                entries[key] = {
+                    "code": code,
+                    "name": str(r.get("name", "")).strip(),
+                    "manual_text": str(r.get("manual_text", "")).strip(),
+                    "confirmed": bool(r.get("confirmed", False)),
+                    "classification_bucket": str(r.get("classification_bucket", "")).strip(),
+                    "updated_at": now,
+                }
+            else:
+                entries[key] = {
+                    "code": code,
+                    "name": str(r.get("name", "")).strip(),
+                    "manual_text": str(r.get("manual_text", "")).strip(),
+                    "confirmed": bool(r.get("confirmed", False)),
+                    "classification_bucket": str(r.get("classification_bucket", "")).strip(),
+                    "updated_at": now,
+                }
             saved += 1
 
         save_store(project_id, store)

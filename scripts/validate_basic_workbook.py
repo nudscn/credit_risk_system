@@ -50,6 +50,7 @@ DEFAULT_ANALYSIS_TEXT_TEMPLATES = {
     "struct_phrase_down": "下降{abs_pp}个百分点",
     "struct_phrase_stable": "基本稳定（变动{abs_pp}个百分点）",
 }
+DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT = 2.0
 
 
 def normalize_project_id(project_id: str) -> str:
@@ -126,6 +127,104 @@ def load_analysis_text_templates(runtime_cfg: Optional[Dict[str, object]]) -> Di
             continue
         cfg[key] = txt
     return cfg
+
+
+def load_analysis_thresholds(runtime_cfg: Optional[Dict[str, object]]) -> Dict[str, Any]:
+    """
+    Two-level threshold policy:
+    1) subject threshold (optional)
+    2) global threshold (required, fallback to runtime config/code default)
+    """
+    global_scale = DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT
+    global_struct = DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT
+    if isinstance(runtime_cfg, dict):
+        try:
+            global_scale = float(runtime_cfg.get("analysis_stable_threshold_pct", DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT))
+        except Exception:
+            global_scale = DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT
+        try:
+            global_struct = float(runtime_cfg.get("analysis_struct_stable_pp", global_scale))
+        except Exception:
+            global_struct = global_scale
+    out: Dict[str, Any] = {
+        "global_scale_pct": global_scale,
+        "global_struct_pp": global_struct,
+        "subject_scale_pct": {},
+        "subject_struct_pp": {},
+        # backward compatibility aliases
+        "global_pct": global_scale,
+        "subject_pct": {},
+    }
+
+    rb = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    if not rb.exists():
+        return out
+    try:
+        wb = load_workbook(rb, data_only=True)
+    except Exception:
+        return out
+    ws = get_sheet_by_name_loose(wb, "analysis_thresholds")
+    if ws is None:
+        ws = get_sheet_by_name_loose(wb, "分析阈值配置")
+    if ws is None:
+        return out
+
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_scope = headers.get("scope", 1)
+    c_subject = headers.get("subject_code", 2)
+    c_scale = headers.get("scale_stable_pct", headers.get("stable_threshold_pct", 3))
+    c_struct = headers.get("struct_stable_pp", c_scale)
+    c_enabled = headers.get("enabled", 4)
+    for r in range(2, ws.max_row + 1):
+        enabled_raw = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled_raw in {"0", "false", "no"}:
+            continue
+        scope = str(ws.cell(r, c_scope).value or "").strip().lower()
+        subject = str(ws.cell(r, c_subject).value or "").strip().upper()
+        try:
+            scale_v = float(ws.cell(r, c_scale).value)
+        except Exception:
+            continue
+        try:
+            struct_v = float(ws.cell(r, c_struct).value)
+        except Exception:
+            struct_v = scale_v
+        if scope in {"global", "全局"}:
+            out["global_scale_pct"] = scale_v
+            out["global_struct_pp"] = struct_v
+            out["global_pct"] = scale_v
+        elif scope in {"subject", "科目"} and re.match(r"^BS\d{3}$", subject):
+            out["subject_scale_pct"][subject] = scale_v
+            out["subject_struct_pp"][subject] = struct_v
+            out["subject_pct"][subject] = scale_v
+    return out
+
+
+def effective_stable_thresholds(code: str, threshold_cfg: Dict[str, Any]) -> Tuple[float, float]:
+    code_u = str(code or "").strip().upper()
+    by_scale = threshold_cfg.get("subject_scale_pct", {}) if isinstance(threshold_cfg, dict) else {}
+    by_struct = threshold_cfg.get("subject_struct_pp", {}) if isinstance(threshold_cfg, dict) else {}
+    if (not by_scale) and isinstance(threshold_cfg, dict):
+        by_scale = threshold_cfg.get("subject_pct", {}) or {}
+    if code_u and isinstance(by_scale, dict) and code_u in by_scale:
+        try:
+            s_scale = float(by_scale[code_u])
+        except Exception:
+            s_scale = float((threshold_cfg or {}).get("global_scale_pct", (threshold_cfg or {}).get("global_pct", DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT)))
+        try:
+            s_struct = float(by_struct.get(code_u, s_scale)) if isinstance(by_struct, dict) else s_scale
+        except Exception:
+            s_struct = s_scale
+        return s_scale, s_struct
+    try:
+        g_scale = float((threshold_cfg or {}).get("global_scale_pct", (threshold_cfg or {}).get("global_pct", DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT)))
+    except Exception:
+        g_scale = DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT
+    try:
+        g_struct = float((threshold_cfg or {}).get("global_struct_pp", g_scale))
+    except Exception:
+        g_struct = g_scale
+    return g_scale, g_struct
 
 
 def parse_years(ws, year_row: int = 3, year_start_col: int = 3) -> List[str]:
@@ -395,6 +494,7 @@ def build_asset_analysis_sheets(
     noncurrent_total_code: str = "BS056",
     asset_total_code: str = "BS057",
     text_templates: Optional[Dict[str, str]] = None,
+    threshold_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
     if len(years) < 3:
         return
@@ -478,8 +578,11 @@ def build_asset_analysis_sheets(
         p21 = _pct_change(v2, v1)
         d32 = _abs_change(v3, v2)
         p32 = _pct_change(v3, v2)
-        l21 = _change_label(p21, stable_pct=stable_threshold_pct)
-        l32 = _change_label(p32, stable_pct=stable_threshold_pct)
+        eff_scale, eff_struct = effective_stable_thresholds(
+            code, threshold_cfg or {"global_scale_pct": stable_threshold_pct, "global_struct_pp": stable_threshold_pct}
+        )
+        l21 = _change_label(p21, stable_pct=eff_scale)
+        l32 = _change_label(p32, stable_pct=eff_scale)
 
         abs_tpl = _pick_tpl_by_code(tpl, "asset_abs", code)
         abs_text = _render_template(
@@ -492,8 +595,8 @@ def build_asset_analysis_sheets(
                 "v1": _fmt_num(v1),
                 "v2": _fmt_num(v2),
                 "v3": _fmt_num(v3),
-                "p21": _scale_phrase(p21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                "p32": _scale_phrase(p32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                "p21": _scale_phrase(p21, stable_pct=eff_scale, text_templates=tpl),
+                "p32": _scale_phrase(p32, stable_pct=eff_scale, text_templates=tpl),
             },
         )
 
@@ -523,7 +626,7 @@ def build_asset_analysis_sheets(
         rt_3 = _safe_div(v3, asset_totals.get(y3))
         rt_d21 = (rt_2 - rt_1) * 100 if rt_2 is not None and rt_1 is not None else None
         rt_d32 = (rt_3 - rt_2) * 100 if rt_3 is not None and rt_2 is not None else None
-        struct_label = _share_label(rt_d32, stable_pct=stable_threshold_pct)
+        struct_label = _share_label(rt_d32, stable_pct=eff_struct)
         struct_text = ""
 
         if code == asset_total_code:
@@ -533,7 +636,7 @@ def build_asset_analysis_sheets(
                 struct_tpl = tpl["asset_total_struct"]
             struct_text = _render_template(struct_tpl, {})
         elif code in {current_total_code, noncurrent_total_code}:
-            struct_label = _share_label(rt_d32, stable_pct=stable_threshold_pct)
+            struct_label = _share_label(rt_d32, stable_pct=eff_struct)
             struct_tpl = _pick_tpl_by_code(tpl, "asset_struct", code) or tpl["asset_subtotal_struct"]
             if not struct_tpl.strip():
                 struct_tpl = tpl["asset_subtotal_struct"]
@@ -546,8 +649,8 @@ def build_asset_analysis_sheets(
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
-                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
         else:
@@ -567,7 +670,7 @@ def build_asset_analysis_sheets(
             r1_3 = _safe_div(v3, b1_3)
             r1_d21 = (r1_2 - r1_1) * 100 if r1_2 is not None and r1_1 is not None else None
             r1_d32 = (r1_3 - r1_2) * 100 if r1_3 is not None and r1_2 is not None else None
-            struct_label = _share_label(r1_d32, stable_pct=stable_threshold_pct)
+            struct_label = _share_label(r1_d32, stable_pct=eff_struct)
             struct_tpl = _pick_tpl_by_code(tpl, "asset_struct", code) or tpl["asset_item_struct"]
             if not struct_tpl.strip():
                 struct_tpl = tpl["asset_item_struct"]
@@ -581,13 +684,13 @@ def build_asset_analysis_sheets(
                     "r11": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
                     "r12": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
                     "r13": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
-                    "r121": _struct_phrase(r1_d21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                    "r132": _struct_phrase(r1_d32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                    "r121": _struct_phrase(r1_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r132": _struct_phrase(r1_d32, stable_pct=eff_struct, text_templates=tpl),
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
-                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
 
@@ -621,6 +724,7 @@ def build_liability_analysis_sheets(
     noncurrent_total_code: str = "BS102",
     liability_total_code: str = "BS103",
     text_templates: Optional[Dict[str, str]] = None,
+    threshold_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
     if len(years) < 3:
         return
@@ -703,8 +807,11 @@ def build_liability_analysis_sheets(
         p21 = _pct_change(v2, v1)
         d32 = _abs_change(v3, v2)
         p32 = _pct_change(v3, v2)
-        l21 = _change_label(p21, stable_pct=stable_threshold_pct)
-        l32 = _change_label(p32, stable_pct=stable_threshold_pct)
+        eff_scale, eff_struct = effective_stable_thresholds(
+            code, threshold_cfg or {"global_scale_pct": stable_threshold_pct, "global_struct_pp": stable_threshold_pct}
+        )
+        l21 = _change_label(p21, stable_pct=eff_scale)
+        l32 = _change_label(p32, stable_pct=eff_scale)
 
         abs_tpl = _pick_tpl_by_code(tpl, "liability_abs", code)
         abs_text = _render_template(
@@ -717,8 +824,8 @@ def build_liability_analysis_sheets(
                 "v1": _fmt_num(v1),
                 "v2": _fmt_num(v2),
                 "v3": _fmt_num(v3),
-                "p21": _scale_phrase(p21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                "p32": _scale_phrase(p32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                "p21": _scale_phrase(p21, stable_pct=eff_scale, text_templates=tpl),
+                "p32": _scale_phrase(p32, stable_pct=eff_scale, text_templates=tpl),
             },
         )
 
@@ -747,7 +854,7 @@ def build_liability_analysis_sheets(
         rt_3 = _safe_div(v3, liability_totals.get(y3))
         rt_d21 = (rt_2 - rt_1) * 100 if rt_2 is not None and rt_1 is not None else None
         rt_d32 = (rt_3 - rt_2) * 100 if rt_3 is not None and rt_2 is not None else None
-        struct_label = _share_label(rt_d32, stable_pct=stable_threshold_pct)
+        struct_label = _share_label(rt_d32, stable_pct=eff_struct)
         struct_text = ""
 
         if code == liability_total_code:
@@ -769,8 +876,8 @@ def build_liability_analysis_sheets(
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
-                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
         else:
@@ -790,7 +897,7 @@ def build_liability_analysis_sheets(
             r1_3 = _safe_div(v3, b1_3)
             r1_d21 = (r1_2 - r1_1) * 100 if r1_2 is not None and r1_1 is not None else None
             r1_d32 = (r1_3 - r1_2) * 100 if r1_3 is not None and r1_2 is not None else None
-            struct_label = _share_label(r1_d32, stable_pct=stable_threshold_pct)
+            struct_label = _share_label(r1_d32, stable_pct=eff_struct)
             struct_tpl = _pick_tpl_by_code(tpl, "liability_struct", code) or tpl["liability_item_struct"]
             if not struct_tpl.strip():
                 struct_tpl = tpl["liability_item_struct"]
@@ -804,13 +911,13 @@ def build_liability_analysis_sheets(
                     "r11": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
                     "r12": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
                     "r13": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
-                    "r121": _struct_phrase(r1_d21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                    "r132": _struct_phrase(r1_d32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                    "r121": _struct_phrase(r1_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r132": _struct_phrase(r1_d32, stable_pct=eff_struct, text_templates=tpl),
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
-                    "rt21": _struct_phrase(rt_d21, stable_pct=stable_threshold_pct, text_templates=tpl),
-                    "rt32": _struct_phrase(rt_d32, stable_pct=stable_threshold_pct, text_templates=tpl),
+                    "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
 
@@ -931,7 +1038,10 @@ def main() -> int:
     recon_ws = get_sheet_by_name_loose(wb, "勾稽校验")
     missing_rows.extend(collect_recon_issues(recon_ws))
     build_missing_sheet(wb, missing_rows)
-    stable_threshold_pct = float(runtime_cfg.get("analysis_stable_threshold_pct", 2.0))
+    threshold_cfg = load_analysis_thresholds(runtime_cfg)
+    stable_threshold_pct = float(
+        threshold_cfg.get("global_scale_pct", threshold_cfg.get("global_pct", runtime_cfg.get("analysis_stable_threshold_pct", 2.0)))
+    )
     analysis_text_templates = load_analysis_text_templates(runtime_cfg)
     build_asset_analysis_sheets(
         wb,
@@ -942,6 +1052,7 @@ def main() -> int:
         noncurrent_total_code=str(runtime_cfg.get("asset_noncurrent_total_code", "BS056")),
         asset_total_code=str(runtime_cfg.get("asset_total_code", "BS057")),
         text_templates=analysis_text_templates,
+        threshold_cfg=threshold_cfg,
     )
     build_liability_analysis_sheets(
         wb,
@@ -952,6 +1063,7 @@ def main() -> int:
         noncurrent_total_code=str(runtime_cfg.get("liability_noncurrent_total_code", "BS102")),
         liability_total_code=str(runtime_cfg.get("liability_total_code", "BS103")),
         text_templates=analysis_text_templates,
+        threshold_cfg=threshold_cfg,
     )
 
     first_order = runtime_cfg.get("sheet_order", [])
