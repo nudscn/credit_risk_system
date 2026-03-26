@@ -38,6 +38,7 @@ WORKBOOK_RULES_CONFIG_PATH = PROJECT_ROOT / "config" / "workbook_rules_v1.json"
 MAIN_TABLE_SCHEMA_PATH = PROJECT_ROOT / "config" / "main_table_schema_v1.json"
 RUNTIME_CONTROL_PATH = PROJECT_ROOT / "config" / "runtime_controls.json"
 RULEBOOK_XLSX_PATH = PROJECT_ROOT / "config" / "rulebook.xlsx"
+DEFAULT_AMOUNT_UNIT = "元"
 
 WORKPAPER_PATH = PROJECT_ROOT / "inputs" / "分析底稿-十堰城运.xlsx"
 BS_PATH = PROJECT_ROOT / "inputs" / "25十运04[258597.SH]-资产负债表.xlsx"
@@ -62,7 +63,7 @@ FORCED_BS_CODE_REDIRECTS = {
 def load_main_table_schema() -> Dict[str, Any]:
     default_schema = {
         "prefix_columns": ["科目编码", "科目名称"],
-        "value_col_template": "{year}年（万元）",
+        "value_col_template": "{year}年（{unit}）",
         "status_col_template": "{year}年状态",
     }
     if not MAIN_TABLE_SCHEMA_PATH.exists():
@@ -126,6 +127,13 @@ def get_code_aliases(runtime_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, 
     if out:
         return out
     return dict(DEFAULT_CODE_ALIASES)
+
+
+def get_amount_unit(runtime_cfg: Optional[Dict[str, Any]] = None, default: str = DEFAULT_AMOUNT_UNIT) -> str:
+    cfg = runtime_cfg or {}
+    raw = cfg.get("amount_unit")
+    text = str(raw or "").strip()
+    return text or default
 
 
 def load_runtime_cfg_from_excel(cfg_path: Path = RULEBOOK_XLSX_PATH) -> Dict[str, Any]:
@@ -255,13 +263,13 @@ def load_workbook_rules_cfg(cfg_path: Path = WORKBOOK_RULES_CONFIG_PATH) -> Dict
         return {}
 
 
-def render_main_table_header(years: List[str], schema: Dict[str, Any]) -> List[str]:
+def render_main_table_header(years: List[str], schema: Dict[str, Any], amount_unit: str = DEFAULT_AMOUNT_UNIT) -> List[str]:
     prefix = schema.get("prefix_columns", ["科目编码", "科目名称"])
     if not isinstance(prefix, list) or len(prefix) < 2:
         prefix = ["科目编码", "科目名称"]
-    value_tpl = str(schema.get("value_col_template", "{year}年（万元）"))
+    value_tpl = str(schema.get("value_col_template", "{year}年（{unit}）"))
     status_tpl = str(schema.get("status_col_template", "{year}年状态"))
-    value_cols = [value_tpl.format(year=y) for y in years]
+    value_cols = [value_tpl.format(year=y, unit=amount_unit) for y in years]
     status_cols = [status_tpl.format(year=y) for y in years]
     return prefix + value_cols + status_cols
 
@@ -609,7 +617,7 @@ def parse_year_token(value: Any) -> Optional[str]:
 def yiyuan_to_wanyuan(value_yiyuan: Optional[float]) -> Optional[float]:
     if value_yiyuan is None:
         return None
-    # Source files are already in 万元, so keep original unit.
+    # Source files may already be normalized to a business unit; keep original numeric scale.
     return round(value_yiyuan, 2)
 
 
@@ -915,7 +923,9 @@ def write_statement_sheet(
     missing_rows: List[dict],
 ) -> Dict[Tuple[str, str], Optional[float]]:
     ws = wb.create_sheet(sheet_name)
-    ws.append(["科目编码", "科目名称"] + [f"{y}年（万元）" for y in years] + [f"{y}年状态" for y in years])
+    amount_unit = DEFAULT_AMOUNT_UNIT
+    value_key = f"值({amount_unit})"
+    ws.append(["科目编码", "科目名称"] + [f"{y}年（{amount_unit}）" for y in years] + [f"{y}年状态" for y in years])
 
     red_font = Font(color="FF0000")
     statement_values: Dict[Tuple[str, str], Optional[float]] = {}
@@ -941,7 +951,7 @@ def write_statement_sheet(
                     "科目编码": code,
                     "科目名称": name,
                     "期间": y,
-                    "值(万元)": value_wanyuan,
+                    value_key: value_wanyuan,
                     "状态": status,
                     "来源类型": rec.source_type if rec else "",
                     "来源文件": rec.file if rec else "",
@@ -1013,6 +1023,7 @@ def write_statement_sheet_from_template(
     source_maps: Dict[str, Dict[Tuple[str, str], List[SourceRecord]]],
     detail_payload: Dict[Tuple[str, str, str], List[dict]],
     missing_rows: List[dict],
+    runtime_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[Tuple[str, str], Optional[float]]:
     ws = get_sheet_by_name_loose(wb, sheet_name)
     if ws is None:
@@ -1025,6 +1036,8 @@ def write_statement_sheet_from_template(
 
     red_font = Font(color="FF0000")
     statement_values: Dict[Tuple[str, str], Optional[float]] = {}
+    amount_unit = get_amount_unit(runtime_cfg)
+    value_key = f"值({amount_unit})"
 
     for item in items:
         code = item["code"]
@@ -1052,7 +1065,7 @@ def write_statement_sheet_from_template(
                     "科目编码": code,
                     "科目名称": name,
                     "期间": y,
-                    "值(万元)": value_wanyuan,
+                    value_key: value_wanyuan,
                     "状态": status,
                     "来源类型": rec.source_type if rec else "",
                     "来源文件": rec.file if rec else "",
@@ -1535,9 +1548,16 @@ def income_subitems(subject_name: str) -> List[str]:
     return ["分项收入A", "分项收入B", "分项收入C"]
 
 
-def build_detail_sheets(wb: Workbook, detail_payload: Dict[Tuple[str, str, str], List[dict]]) -> int:
+def build_detail_sheets(
+    wb: Workbook,
+    detail_payload: Dict[Tuple[str, str, str], List[dict]],
+    runtime_cfg: Optional[Dict[str, Any]] = None,
+) -> int:
     used_names = set()
     created = 0
+    amount_unit = get_amount_unit(runtime_cfg)
+    main_col_name = f"主表值({amount_unit})"
+    detail_col_name = f"明细值({amount_unit})"
 
     for (report, subject_name, code), rows in detail_payload.items():
         is_bs = is_asset_or_liability_detail(report, code)
@@ -1563,8 +1583,8 @@ def build_detail_sheets(wb: Workbook, detail_payload: Dict[Tuple[str, str, str],
                 "期间",
                 "对方账户",
                 "分项收入/子项收入",
-                "主表值(万元)",
-                "明细值(万元)",
+                main_col_name,
+                detail_col_name,
                 "状态",
                 "说明",
                 "来源类型",
@@ -1577,6 +1597,8 @@ def build_detail_sheets(wb: Workbook, detail_payload: Dict[Tuple[str, str, str],
 
         for r in rows:
             note = "框架保留，请按客观资料补录明细；系统不做模拟拆分。"
+            value_key = next((k for k in r.keys() if str(k).startswith("值(")), f"值({amount_unit})")
+            raw_value = r.get(value_key)
             if is_bs:
                 parties = ["待补充A", "待补充B", "待补充C"]
                 for party in parties:
@@ -1587,9 +1609,9 @@ def build_detail_sheets(wb: Workbook, detail_payload: Dict[Tuple[str, str, str],
                         r["期间"],
                         party,
                         "往来款项",
-                        r["值(万元)"],
+                        raw_value,
                         None,
-                        r["状态"] if r["值(万元)"] is not None else "待补充",
+                        r["状态"] if raw_value is not None else "待补充",
                         note,
                         r.get("来源类型", ""),
                         r.get("来源文件", ""),
@@ -1607,9 +1629,9 @@ def build_detail_sheets(wb: Workbook, detail_payload: Dict[Tuple[str, str, str],
                         r["期间"],
                         "",
                         sub,
-                        r["值(万元)"],
+                        raw_value,
                         None,
-                        r["状态"] if r["值(万元)"] is not None else "待补充",
+                        r["状态"] if raw_value is not None else "待补充",
                         note,
                         r.get("来源类型", ""),
                         r.get("来源文件", ""),
@@ -1630,9 +1652,12 @@ def build_equity_statement_sheet(
     is_values: Dict[Tuple[str, str], Optional[float]],
     detail_payload: Dict[Tuple[str, str, str], List[dict]],
     missing_rows: List[dict],
+    runtime_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[Tuple[str, str], Optional[float]]:
     ws = wb.create_sheet("所有者权益变动表")
-    ws.append(["科目编码", "科目名称"] + [f"{y}年（万元）" for y in years] + [f"{y}年状态" for y in years])
+    amount_unit = get_amount_unit(runtime_cfg)
+    value_key = f"值({amount_unit})"
+    ws.append(["科目编码", "科目名称"] + [f"{y}年（{amount_unit}）" for y in years] + [f"{y}年状态" for y in years])
 
     items = [
         ("EQ001", "年初所有者权益", "所有者权益合计", "derived_prev_year"),
@@ -1671,7 +1696,7 @@ def build_equity_statement_sheet(
                     "科目编码": code,
                     "科目名称": name,
                     "期间": y,
-                    "值(万元)": val,
+                    value_key: val,
                     "状态": status,
                     "来源类型": "derived" if "推导" in status else "mapped",
                     "来源文件": "",
@@ -1706,9 +1731,12 @@ def build_cash_supp_sheet(
     is_values: Dict[Tuple[str, str], Optional[float]],
     cf_values: Dict[Tuple[str, str], Optional[float]],
     bs_values: Dict[Tuple[str, str], Optional[float]],
+    runtime_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[Tuple[str, str], Optional[float]]:
     ws = wb.create_sheet("现金流补充资料")
-    ws.append(["科目编码", "科目名称"] + [f"{y}年（万元）" for y in years] + [f"{y}年状态" for y in years])
+    amount_unit = get_amount_unit(runtime_cfg)
+    value_key = f"值({amount_unit})"
+    ws.append(["科目编码", "科目名称"] + [f"{y}年（{amount_unit}）" for y in years] + [f"{y}年状态" for y in years])
 
     items = [
         ("CS001", "净利润"),
@@ -1763,7 +1791,7 @@ def build_cash_supp_sheet(
                     "科目编码": code,
                     "科目名称": name,
                     "期间": y,
-                    "值(万元)": value,
+                    value_key: value,
                     "状态": status,
                     "来源类型": source_type,
                     "来源文件": "",
@@ -1786,12 +1814,14 @@ def build_interest_debt_sheet(
     runtime_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[Tuple[str, str], Optional[float]]:
     """Build standalone interest-bearing debt detail sheet."""
+    amount_unit = get_amount_unit(runtime_cfg)
+    value_key = f"值({amount_unit})"
     ws = get_sheet_by_name_loose(wb, "有息负债明细")
     if ws is None:
         ws = wb.create_sheet("有息负债明细")
     else:
         ws.delete_rows(1, ws.max_row)
-    ws.append(["期间", "子项", "值(万元)", "说明"])
+    ws.append(["期间", "子项", value_key, "说明"])
 
     items = get_interest_debt_items(runtime_cfg)
     out: Dict[Tuple[str, str], Optional[float]] = {}
@@ -1811,7 +1841,7 @@ def build_interest_debt_sheet(
                     "科目编码": "DEBT001",
                     "科目名称": name,
                     "期间": y,
-                    "值(万元)": v,
+                    value_key: v,
                     "状态": "已识别" if v is not None else "待补充",
                     "来源类型": "from_bs",
                     "来源文件": "",
@@ -1830,7 +1860,7 @@ def build_interest_debt_sheet(
                 "科目编码": "DEBT999",
                 "科目名称": "有息负债合计",
                 "期间": y,
-                "值(万元)": total_val,
+                value_key: total_val,
                 "状态": "已推导" if total_val is not None else "待补充",
                 "来源类型": "derived",
                 "来源文件": "",
@@ -1934,6 +1964,7 @@ def main() -> int:
             source_maps=source_maps,
             detail_payload=detail_payload,
             missing_rows=missing_rows,
+            runtime_cfg=runtime_cfg,
         )
         all_values[sname] = values
 
@@ -1944,6 +1975,7 @@ def main() -> int:
         all_values.get("利润表", {}),
         detail_payload,
         missing_rows,
+        runtime_cfg=runtime_cfg,
     )
     all_values["所有者权益变动表"] = eq_values
 

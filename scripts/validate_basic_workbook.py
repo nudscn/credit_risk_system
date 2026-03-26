@@ -33,15 +33,16 @@ from build_basic_data_workbook import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_AMOUNT_UNIT = "元"
 DEFAULT_ANALYSIS_TEXT_TEMPLATES = {
-    "asset_abs": "{name}，{y1}年{v1}万元，{y2}年{v2}万元，{y3}年{v3}万元；{y2}年较{y1}年{p21}，{y3}年较{y2}年{p32}。",
-    "liability_abs": "{name}，{y1}年{v1}万元，{y2}年{v2}万元，{y3}年{v3}万元；{y2}年较{y1}年{p21}，{y3}年较{y2}年{p32}。",
+    "asset_abs": "{name}，{y1}年{v1}{unit}，{y2}年{v2}{unit}，{y3}年{v3}{unit}；{y2}年较{y1}年{p21}，{y3}年较{y2}年{p32}。",
+    "liability_abs": "{name}，{y1}年{v1}{unit}，{y2}年{v2}{unit}，{y3}年{v3}{unit}；{y2}年较{y1}年{p21}，{y3}年较{y2}年{p32}。",
     "asset_total_struct": "资产总计仅描述绝对量变化，不做占比分析。",
-    "asset_subtotal_struct": "占总资产比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
-    "asset_item_struct": "{base1_label}：{y1}年{r11}%，{y2}年{r12}%，{y3}年{r13}%；{y2}较{y1}{r121}，{y3}较{y2}{r132}。占总资产比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+    "asset_subtotal_struct": "占总资产比例：{y1}年{r2_1}%，{y2}年{r2_2}%，{y3}年{r2_3}%；{y2}较{y1}{r2_21}，{y3}较{y2}{r2_32}。",
+    "asset_item_struct": "{base1_label}：{y1}年{r1_1}%，{y2}年{r1_2}%，{y3}年{r1_3}%；{y2}较{y1}{r1_21}，{y3}较{y2}{r1_32}。占总资产比例：{y1}年{r2_1}%，{y2}年{r2_2}%，{y3}年{r2_3}%；{y2}较{y1}{r2_21}，{y3}较{y2}{r2_32}。",
     "liability_total_struct": "负债合计仅描述绝对量变化，不做占比分析。",
-    "liability_subtotal_struct": "占负债总计比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
-    "liability_item_struct": "{base1_label}：{y1}年{r11}%，{y2}年{r12}%，{y3}年{r13}%；{y2}较{y1}{r121}，{y3}较{y2}{r132}。占负债总计比例：{y1}年{rt1}%，{y2}年{rt2}%，{y3}年{rt3}%；{y2}较{y1}{rt21}，{y3}较{y2}{rt32}。",
+    "liability_subtotal_struct": "占负债总计比例：{y1}年{r2_1}%，{y2}年{r2_2}%，{y3}年{r2_3}%；{y2}较{y1}{r2_21}，{y3}较{y2}{r2_32}。",
+    "liability_item_struct": "{base1_label}：{y1}年{r1_1}%，{y2}年{r1_2}%，{y3}年{r1_3}%；{y2}较{y1}{r1_21}，{y3}较{y2}{r1_32}。占负债总计比例：{y1}年{r2_1}%，{y2}年{r2_2}%，{y3}年{r2_3}%；{y2}较{y1}{r2_21}，{y3}较{y2}{r2_32}。",
     # phrase policies for absolute/relative trend wording
     "scale_phrase_up": "增加{abs_pct}%",
     "scale_phrase_down": "减少{abs_pct}%",
@@ -49,6 +50,10 @@ DEFAULT_ANALYSIS_TEXT_TEMPLATES = {
     "struct_phrase_up": "上升{abs_pp}个百分点",
     "struct_phrase_down": "下降{abs_pp}个百分点",
     "struct_phrase_stable": "基本稳定（变动{abs_pp}个百分点）",
+}
+DEFAULT_ANALYSIS_TEMPLATE_UNITS = {
+    "asset_abs": DEFAULT_AMOUNT_UNIT,
+    "liability_abs": DEFAULT_AMOUNT_UNIT,
 }
 DEFAULT_ANALYSIS_STABLE_THRESHOLD_PCT = 2.0
 
@@ -64,6 +69,15 @@ def get_runtime_text(runtime_cfg: Optional[Dict[str, object]], key: str, default
     val = runtime_cfg.get(key)
     txt = str(val or "").strip()
     return txt or default
+
+
+def get_amount_unit(runtime_cfg: Optional[Dict[str, object]] = None, default: str = DEFAULT_AMOUNT_UNIT) -> str:
+    if isinstance(runtime_cfg, dict):
+        raw = runtime_cfg.get("amount_unit")
+        txt = str(raw or "").strip()
+        if txt:
+            return txt
+    return default
 
 
 def _render_template(template: str, values: Dict[str, Any]) -> str:
@@ -85,6 +99,16 @@ def _pick_tpl_by_code(tpl: Dict[str, str], base_key: str, code: str) -> str:
         if isinstance(v, str) and v.strip():
             return v
     return tpl.get(base_key, DEFAULT_ANALYSIS_TEXT_TEMPLATES.get(base_key, ""))
+
+
+def _pick_tpl_unit_by_code(unit_map: Dict[str, str], base_key: str, code: str, default: str = DEFAULT_AMOUNT_UNIT) -> str:
+    c = str(code or "").strip()
+    if c:
+        u = str(unit_map.get(f"{base_key}_{c}", "") or "").strip()
+        if u:
+            return u
+    u = str(unit_map.get(base_key, "") or "").strip()
+    return u or default
 
 
 def load_analysis_text_templates(runtime_cfg: Optional[Dict[str, object]]) -> Dict[str, str]:
@@ -126,6 +150,52 @@ def load_analysis_text_templates(runtime_cfg: Optional[Dict[str, object]]) -> Di
         if not key or not txt or "?" in txt or "�" in txt:
             continue
         cfg[key] = txt
+    return cfg
+
+
+def load_analysis_template_units(runtime_cfg: Optional[Dict[str, object]]) -> Dict[str, str]:
+    amount_unit = get_amount_unit(runtime_cfg)
+    cfg = {
+        "asset_abs": amount_unit,
+        "liability_abs": amount_unit,
+        "_default": amount_unit,
+    }
+
+    if isinstance(runtime_cfg, dict):
+        raw = runtime_cfg.get("analysis_template_units")
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                kk = str(k or "").strip()
+                vv = str(v or "").strip()
+                if kk and vv:
+                    cfg[kk] = vv
+
+    rb = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    if not rb.exists():
+        return cfg
+    try:
+        wb = load_workbook(rb, data_only=True)
+    except Exception:
+        return cfg
+    ws = get_sheet_by_name_loose(wb, "analysis_text_templates")
+    if ws is None:
+        ws = get_sheet_by_name_loose(wb, "分析文本模板")
+    if ws is None:
+        return cfg
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_key = headers.get("template_key", 1)
+    c_unit = headers.get("unit")
+    c_enabled = headers.get("enabled", 3)
+    if not c_unit:
+        return cfg
+    for r in range(2, ws.max_row + 1):
+        enabled_raw = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled_raw in {"0", "false", "no"}:
+            continue
+        key = str(ws.cell(r, c_key).value or "").strip()
+        unit = str(ws.cell(r, c_unit).value or "").strip()
+        if key and unit:
+            cfg[key] = unit
     return cfg
 
 
@@ -333,7 +403,8 @@ def create_interest_debt_sheet_if_missing(
         return
 
     ws = wb.create_sheet(debt_sheet_name)
-    ws.append(["期间", "子项", "值(万元)", "说明"])
+    amount_unit = get_amount_unit(runtime_cfg)
+    ws.append(["期间", "子项", f"值({amount_unit})", "说明"])
     items = get_interest_debt_items(runtime_cfg)
     for y in years:
         total = 0.0
@@ -494,14 +565,18 @@ def build_asset_analysis_sheets(
     noncurrent_total_code: str = "BS056",
     asset_total_code: str = "BS057",
     text_templates: Optional[Dict[str, str]] = None,
+    text_template_units: Optional[Dict[str, str]] = None,
     threshold_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
     if len(years) < 3:
         return
 
     y1, y2, y3 = years[0], years[1], years[2]
+    amount_unit = str((text_template_units or {}).get("_default", DEFAULT_AMOUNT_UNIT) if isinstance(text_template_units, dict) else DEFAULT_AMOUNT_UNIT)
     tpl = dict(DEFAULT_ANALYSIS_TEXT_TEMPLATES)
     tpl.update(text_templates or {})
+    tpl_units = dict(DEFAULT_ANALYSIS_TEMPLATE_UNITS)
+    tpl_units.update(text_template_units or {})
 
     rows: List[dict] = []
     code_year_values: Dict[str, Dict[str, Optional[float]]] = {}
@@ -532,13 +607,13 @@ def build_asset_analysis_sheets(
         [
             "科目编码",
             "科目名称",
-            f"{y1}年(万元)",
-            f"{y2}年(万元)",
-            f"{y3}年(万元)",
-            f"{y2}较{y1}变动额(万元)",
+            f"{y1}年({amount_unit})",
+            f"{y2}年({amount_unit})",
+            f"{y3}年({amount_unit})",
+            f"{y2}较{y1}变动额({amount_unit})",
             f"{y2}较{y1}变动率(%)",
             f"{y2}较{y1}变化判断",
-            f"{y3}较{y2}变动额(万元)",
+            f"{y3}较{y2}变动额({amount_unit})",
             f"{y3}较{y2}变动率(%)",
             f"{y3}较{y2}变化判断",
             "定量描述_绝对量",
@@ -585,6 +660,7 @@ def build_asset_analysis_sheets(
         l32 = _change_label(p32, stable_pct=eff_scale)
 
         abs_tpl = _pick_tpl_by_code(tpl, "asset_abs", code)
+        abs_unit = _pick_tpl_unit_by_code(tpl_units, "asset_abs", code, default=amount_unit)
         abs_text = _render_template(
             abs_tpl,
             {
@@ -597,6 +673,7 @@ def build_asset_analysis_sheets(
                 "v3": _fmt_num(v3),
                 "p21": _scale_phrase(p21, stable_pct=eff_scale, text_templates=tpl),
                 "p32": _scale_phrase(p32, stable_pct=eff_scale, text_templates=tpl),
+                "unit": abs_unit,
             },
         )
 
@@ -626,6 +703,7 @@ def build_asset_analysis_sheets(
         rt_3 = _safe_div(v3, asset_totals.get(y3))
         rt_d21 = (rt_2 - rt_1) * 100 if rt_2 is not None and rt_1 is not None else None
         rt_d32 = (rt_3 - rt_2) * 100 if rt_3 is not None and rt_2 is not None else None
+        rt_d31 = (rt_3 - rt_1) * 100 if rt_3 is not None and rt_1 is not None else None
         struct_label = _share_label(rt_d32, stable_pct=eff_struct)
         struct_text = ""
 
@@ -646,11 +724,19 @@ def build_asset_analysis_sheets(
                     "y1": y1,
                     "y2": y2,
                     "y3": y3,
+                    "r2_1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "r2_2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "r2_3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "r2_21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
+                    # Legacy aliases (backward compatible with existing templates).
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
                     "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
                     "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "rt31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
         else:
@@ -670,6 +756,7 @@ def build_asset_analysis_sheets(
             r1_3 = _safe_div(v3, b1_3)
             r1_d21 = (r1_2 - r1_1) * 100 if r1_2 is not None and r1_1 is not None else None
             r1_d32 = (r1_3 - r1_2) * 100 if r1_3 is not None and r1_2 is not None else None
+            r1_d31 = (r1_3 - r1_1) * 100 if r1_3 is not None and r1_1 is not None else None
             struct_label = _share_label(r1_d32, stable_pct=eff_struct)
             struct_tpl = _pick_tpl_by_code(tpl, "asset_struct", code) or tpl["asset_item_struct"]
             if not struct_tpl.strip():
@@ -681,16 +768,31 @@ def build_asset_analysis_sheets(
                     "y1": y1,
                     "y2": y2,
                     "y3": y3,
+                    "r1_1": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
+                    "r1_2": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
+                    "r1_3": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
+                    "r1_21": _struct_phrase(r1_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r1_32": _struct_phrase(r1_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r1_31": _struct_phrase(r1_d31, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "r2_2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "r2_3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "r2_21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
+                    # Legacy aliases (backward compatible with existing templates).
                     "r11": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
                     "r12": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
                     "r13": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
                     "r121": _struct_phrase(r1_d21, stable_pct=eff_struct, text_templates=tpl),
                     "r132": _struct_phrase(r1_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r131": _struct_phrase(r1_d31, stable_pct=eff_struct, text_templates=tpl),
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
                     "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
                     "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "rt31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
 
@@ -724,14 +826,18 @@ def build_liability_analysis_sheets(
     noncurrent_total_code: str = "BS102",
     liability_total_code: str = "BS103",
     text_templates: Optional[Dict[str, str]] = None,
+    text_template_units: Optional[Dict[str, str]] = None,
     threshold_cfg: Optional[Dict[str, Any]] = None,
 ) -> None:
     if len(years) < 3:
         return
 
     y1, y2, y3 = years[0], years[1], years[2]
+    amount_unit = str((text_template_units or {}).get("_default", DEFAULT_AMOUNT_UNIT) if isinstance(text_template_units, dict) else DEFAULT_AMOUNT_UNIT)
     tpl = dict(DEFAULT_ANALYSIS_TEXT_TEMPLATES)
     tpl.update(text_templates or {})
+    tpl_units = dict(DEFAULT_ANALYSIS_TEMPLATE_UNITS)
+    tpl_units.update(text_template_units or {})
 
     rows: List[dict] = []
     code_year_values: Dict[str, Dict[str, Optional[float]]] = {}
@@ -761,13 +867,13 @@ def build_liability_analysis_sheets(
         [
             "科目编码",
             "科目名称",
-            f"{y1}年(万元)",
-            f"{y2}年(万元)",
-            f"{y3}年(万元)",
-            f"{y2}较{y1}变动额(万元)",
+            f"{y1}年({amount_unit})",
+            f"{y2}年({amount_unit})",
+            f"{y3}年({amount_unit})",
+            f"{y2}较{y1}变动额({amount_unit})",
             f"{y2}较{y1}变动率(%)",
             f"{y2}较{y1}变化判断",
-            f"{y3}较{y2}变动额(万元)",
+            f"{y3}较{y2}变动额({amount_unit})",
             f"{y3}较{y2}变动率(%)",
             f"{y3}较{y2}变化判断",
             "定量描述_绝对量",
@@ -814,6 +920,7 @@ def build_liability_analysis_sheets(
         l32 = _change_label(p32, stable_pct=eff_scale)
 
         abs_tpl = _pick_tpl_by_code(tpl, "liability_abs", code)
+        abs_unit = _pick_tpl_unit_by_code(tpl_units, "liability_abs", code, default=amount_unit)
         abs_text = _render_template(
             abs_tpl,
             {
@@ -826,6 +933,7 @@ def build_liability_analysis_sheets(
                 "v3": _fmt_num(v3),
                 "p21": _scale_phrase(p21, stable_pct=eff_scale, text_templates=tpl),
                 "p32": _scale_phrase(p32, stable_pct=eff_scale, text_templates=tpl),
+                "unit": abs_unit,
             },
         )
 
@@ -854,6 +962,7 @@ def build_liability_analysis_sheets(
         rt_3 = _safe_div(v3, liability_totals.get(y3))
         rt_d21 = (rt_2 - rt_1) * 100 if rt_2 is not None and rt_1 is not None else None
         rt_d32 = (rt_3 - rt_2) * 100 if rt_3 is not None and rt_2 is not None else None
+        rt_d31 = (rt_3 - rt_1) * 100 if rt_3 is not None and rt_1 is not None else None
         struct_label = _share_label(rt_d32, stable_pct=eff_struct)
         struct_text = ""
 
@@ -873,11 +982,19 @@ def build_liability_analysis_sheets(
                     "y1": y1,
                     "y2": y2,
                     "y3": y3,
+                    "r2_1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "r2_2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "r2_3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "r2_21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
+                    # Legacy aliases (backward compatible with existing templates).
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
                     "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
                     "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "rt31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
         else:
@@ -897,6 +1014,7 @@ def build_liability_analysis_sheets(
             r1_3 = _safe_div(v3, b1_3)
             r1_d21 = (r1_2 - r1_1) * 100 if r1_2 is not None and r1_1 is not None else None
             r1_d32 = (r1_3 - r1_2) * 100 if r1_3 is not None and r1_2 is not None else None
+            r1_d31 = (r1_3 - r1_1) * 100 if r1_3 is not None and r1_1 is not None else None
             struct_label = _share_label(r1_d32, stable_pct=eff_struct)
             struct_tpl = _pick_tpl_by_code(tpl, "liability_struct", code) or tpl["liability_item_struct"]
             if not struct_tpl.strip():
@@ -908,16 +1026,31 @@ def build_liability_analysis_sheets(
                     "y1": y1,
                     "y2": y2,
                     "y3": y3,
+                    "r1_1": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
+                    "r1_2": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
+                    "r1_3": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
+                    "r1_21": _struct_phrase(r1_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r1_32": _struct_phrase(r1_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r1_31": _struct_phrase(r1_d31, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
+                    "r2_2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
+                    "r2_3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
+                    "r2_21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r2_31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
+                    # Legacy aliases (backward compatible with existing templates).
                     "r11": _fmt_num(r1_1 * 100 if r1_1 is not None else None),
                     "r12": _fmt_num(r1_2 * 100 if r1_2 is not None else None),
                     "r13": _fmt_num(r1_3 * 100 if r1_3 is not None else None),
                     "r121": _struct_phrase(r1_d21, stable_pct=eff_struct, text_templates=tpl),
                     "r132": _struct_phrase(r1_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "r131": _struct_phrase(r1_d31, stable_pct=eff_struct, text_templates=tpl),
                     "rt1": _fmt_num(rt_1 * 100 if rt_1 is not None else None),
                     "rt2": _fmt_num(rt_2 * 100 if rt_2 is not None else None),
                     "rt3": _fmt_num(rt_3 * 100 if rt_3 is not None else None),
                     "rt21": _struct_phrase(rt_d21, stable_pct=eff_struct, text_templates=tpl),
                     "rt32": _struct_phrase(rt_d32, stable_pct=eff_struct, text_templates=tpl),
+                    "rt31": _struct_phrase(rt_d31, stable_pct=eff_struct, text_templates=tpl),
                 },
             )
 
@@ -1043,6 +1176,7 @@ def main() -> int:
         threshold_cfg.get("global_scale_pct", threshold_cfg.get("global_pct", runtime_cfg.get("analysis_stable_threshold_pct", 2.0)))
     )
     analysis_text_templates = load_analysis_text_templates(runtime_cfg)
+    analysis_template_units = load_analysis_template_units(runtime_cfg)
     build_asset_analysis_sheets(
         wb,
         bs_ws,
@@ -1052,6 +1186,7 @@ def main() -> int:
         noncurrent_total_code=str(runtime_cfg.get("asset_noncurrent_total_code", "BS056")),
         asset_total_code=str(runtime_cfg.get("asset_total_code", "BS057")),
         text_templates=analysis_text_templates,
+        text_template_units=analysis_template_units,
         threshold_cfg=threshold_cfg,
     )
     build_liability_analysis_sheets(
@@ -1063,6 +1198,7 @@ def main() -> int:
         noncurrent_total_code=str(runtime_cfg.get("liability_noncurrent_total_code", "BS102")),
         liability_total_code=str(runtime_cfg.get("liability_total_code", "BS103")),
         text_templates=analysis_text_templates,
+        text_template_units=analysis_template_units,
         threshold_cfg=threshold_cfg,
     )
 
