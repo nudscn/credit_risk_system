@@ -39,7 +39,7 @@ LIABILITY_ANALYSIS_SHEETS = {
     "scale": ["分析_规模变化_负债类"],
     "structure": ["分析_结构占比_负债类"],
 }
-SUMMARY_ANALYSIS_ITEMS = [
+DEFAULT_SUMMARY_ANALYSIS_ITEMS = [
     {"code": "SUM001", "name": "流动资产", "kind": "bs", "source_code": "BS000", "code_candidates": ["BS000", "BS027"]},
     {"code": "SUM002", "name": "非流动资产", "kind": "bs", "source_code": "BS028", "code_candidates": ["BS028", "BS056"]},
     {"code": "SUM003", "name": "资产总计", "kind": "bs", "source_code": "BS057", "code_candidates": ["BS057"]},
@@ -54,13 +54,13 @@ SUMMARY_ANALYSIS_ITEMS = [
 ]
 SUMMARY_TOP_COVERAGE_TARGET_PCT = 75.0
 SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME = 90.0
-SUMMARY_EXCLUDE_CODES = {
+DEFAULT_SUMMARY_EXCLUDE_CODES = {
     "SUM001": {"BS004", "BS009", "BS015"},  # 流动资产：排除不同层级科目
     "SUM002": {"BS041", "BS044"},  # 非流动资产：排除不同层级科目
     "SUM004": {"BS062", "BS070"},  # 流动负债：排除不同层级科目
     "SUM005": {"BS094"},  # 非流动负债：排除不同层级科目
 }
-ANALYSIS_CODE_REDIRECTS = {
+DEFAULT_ANALYSIS_CODE_REDIRECTS = {
     "asset_analysis": {
         "BS028": "BS056",  # 非流动资产 <- 非流动资产合计
     },
@@ -82,7 +82,13 @@ RULE_EDIT_SOURCES = [
         "source_id": "rulebook_main",
         "label": "资产负债分析规则（rulebook.xlsx）",
         "path": PROJECT_ROOT / "config" / "rulebook.xlsx",
-        "sheets": ["analysis_text_templates", "analysis_thresholds"],
+        "sheets": [
+            "analysis_text_templates",
+            "analysis_thresholds",
+            "summary_analysis_items",
+            "summary_exclude_codes",
+            "analysis_code_redirects",
+        ],
     },
     {
         "source_id": "profit_rulebook",
@@ -431,6 +437,114 @@ def _read_threshold_config() -> Dict[str, Any]:
         "global_pct": global_scale_pct,
         "subject_pct": subject_scale_map,
     }
+
+
+def _load_summary_analysis_items() -> List[Dict[str, Any]]:
+    p = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    if not p.exists():
+        return list(DEFAULT_SUMMARY_ANALYSIS_ITEMS)
+    try:
+        wb = load_workbook(p, data_only=True)
+    except Exception:
+        return list(DEFAULT_SUMMARY_ANALYSIS_ITEMS)
+    ws = get_sheet_by_loose_name(wb, ["summary_analysis_items", "汇总分析科目"])
+    if ws is None:
+        return list(DEFAULT_SUMMARY_ANALYSIS_ITEMS)
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_code = headers.get("code", 1)
+    c_name = headers.get("name", 2)
+    c_kind = headers.get("kind", 3)
+    c_source = headers.get("source_code", 4)
+    c_candidates = headers.get("code_candidates", 5)
+    c_keywords = headers.get("name_keywords", 6)
+    c_enabled = headers.get("enabled", 7)
+    out: List[Dict[str, Any]] = []
+    for r in range(2, ws.max_row + 1):
+        enabled = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled in {"0", "false", "no", "n"}:
+            continue
+        code = str(ws.cell(r, c_code).value or "").strip()
+        name = str(ws.cell(r, c_name).value or "").strip()
+        kind = str(ws.cell(r, c_kind).value or "").strip()
+        source_code = str(ws.cell(r, c_source).value or "").strip()
+        if not code or not name or not kind:
+            continue
+        raw_candidates = str(ws.cell(r, c_candidates).value or "").strip()
+        raw_keywords = str(ws.cell(r, c_keywords).value or "").strip()
+        code_candidates = [x.strip() for x in raw_candidates.replace("，", ",").split(",") if x.strip()]
+        name_keywords = [x.strip() for x in raw_keywords.replace("，", ",").split(",") if x.strip()]
+        obj: Dict[str, Any] = {
+            "code": code,
+            "name": name,
+            "kind": kind,
+            "source_code": source_code,
+            "code_candidates": code_candidates,
+        }
+        if name_keywords:
+            obj["name_keywords"] = name_keywords
+        out.append(obj)
+    return out or list(DEFAULT_SUMMARY_ANALYSIS_ITEMS)
+
+
+def _load_summary_exclude_codes() -> Dict[str, set]:
+    p = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    default_map = {k: set(v) for k, v in DEFAULT_SUMMARY_EXCLUDE_CODES.items()}
+    if not p.exists():
+        return default_map
+    try:
+        wb = load_workbook(p, data_only=True)
+    except Exception:
+        return default_map
+    ws = get_sheet_by_loose_name(wb, ["summary_exclude_codes", "汇总排除科目"])
+    if ws is None:
+        return default_map
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_sum = headers.get("summary_code", 1)
+    c_ex = headers.get("exclude_codes", 2)
+    c_enabled = headers.get("enabled", 3)
+    out: Dict[str, set] = {}
+    for r in range(2, ws.max_row + 1):
+        enabled = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled in {"0", "false", "no", "n"}:
+            continue
+        sum_code = str(ws.cell(r, c_sum).value or "").strip().upper()
+        raw = str(ws.cell(r, c_ex).value or "").strip()
+        if not sum_code:
+            continue
+        vals = {x.strip().upper() for x in raw.replace("，", ",").split(",") if x.strip()}
+        out[sum_code] = vals
+    return out or default_map
+
+
+def _load_analysis_code_redirects() -> Dict[str, Dict[str, str]]:
+    p = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    default_map = {g: dict(m) for g, m in DEFAULT_ANALYSIS_CODE_REDIRECTS.items()}
+    if not p.exists():
+        return default_map
+    try:
+        wb = load_workbook(p, data_only=True)
+    except Exception:
+        return default_map
+    ws = get_sheet_by_loose_name(wb, ["analysis_code_redirects", "分析编码重定向"])
+    if ws is None:
+        return default_map
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_group = headers.get("group_id", 1)
+    c_src = headers.get("src_code", 2)
+    c_dst = headers.get("dst_code", 3)
+    c_enabled = headers.get("enabled", 4)
+    out: Dict[str, Dict[str, str]] = {}
+    for r in range(2, ws.max_row + 1):
+        enabled = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled in {"0", "false", "no", "n"}:
+            continue
+        gid = str(ws.cell(r, c_group).value or "").strip()
+        src = str(ws.cell(r, c_src).value or "").strip().upper()
+        dst = str(ws.cell(r, c_dst).value or "").strip().upper()
+        if not gid or not src or not dst:
+            continue
+        out.setdefault(gid, {})[src] = dst
+    return out or default_map
 
 
 def _save_threshold_config(
@@ -4246,7 +4360,7 @@ def build_analysis_map(wb, project_id: str, sheet_map: Dict[str, List[str]], gro
 
 
 def apply_analysis_code_redirects(group_id: str, analysis_data: Dict[str, Any]) -> Dict[str, Any]:
-    redirect_map = ANALYSIS_CODE_REDIRECTS.get(group_id, {})
+    redirect_map = _load_analysis_code_redirects().get(group_id, {})
     if not redirect_map:
         return analysis_data
 
@@ -4524,7 +4638,9 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
         summary_threshold_cfg.get("summary_top_coverage_income", float(SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME))
     )
 
-    for item in SUMMARY_ANALYSIS_ITEMS:
+    summary_items = _load_summary_analysis_items()
+    summary_excludes = _load_summary_exclude_codes()
+    for item in summary_items:
         code = str(item["code"])
         name = str(item["name"])
         kind = str(item.get("kind", ""))
@@ -4716,9 +4832,9 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
         # Upgrade selected summary subjects with "Top composition + migration" narrative.
         comps: List[Dict[str, Any]] = []
         if code == "SUM001":
-            comps = _build_bs_components([(1, 26)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM001", set())))
+            comps = _build_bs_components([(1, 26)], excludes=set(summary_excludes.get("SUM001", set())))
         elif code == "SUM002":
-            comps = _build_bs_components([(29, 55)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM002", set())))
+            comps = _build_bs_components([(29, 55)], excludes=set(summary_excludes.get("SUM002", set())))
         elif code == "SUM003":
             # Asset total: use two subtotal buckets only (流动资产合计 / 非流动资产合计).
             c_cur = _pick_bs_value({"code_candidates": ["BS000", "BS027"]})
@@ -4734,9 +4850,9 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
                 f"{y1}-{y3}年，流动资产合计占比{_up_down_pp(d_cur)}；非流动资产合计占比{_up_down_pp(d_non)}。"
             )
         elif code == "SUM004":
-            comps = _build_bs_components([(59, 88)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM004", set())))
+            comps = _build_bs_components([(59, 88)], excludes=set(summary_excludes.get("SUM004", set())))
         elif code == "SUM005":
-            comps = _build_bs_components([(91, 101)], excludes=set(SUMMARY_EXCLUDE_CODES.get("SUM005", set())))
+            comps = _build_bs_components([(91, 101)], excludes=set(summary_excludes.get("SUM005", set())))
         elif code == "SUM006":
             # Liability total: use two subtotal buckets only (流动负债合计 / 非流动负债合计).
             c_cur = _pick_bs_value({"code_candidates": ["BS058", "BS089"]})
@@ -4774,7 +4890,7 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
     analysis_rows: List[Dict[str, Any]] = []
     scale_by_code = {str(r.get("科目编码", "")): r for r in scale_rows}
     struct_by_code = {str(r.get("科目编码", "")): r for r in struct_rows}
-    for item in SUMMARY_ANALYSIS_ITEMS:
+    for item in summary_items:
         code = str(item["code"])
         name = str(item["name"])
         auto_abs = str(scale_by_code.get(code, {}).get("定量描述_绝对量", "") or "")
@@ -5817,6 +5933,9 @@ const SHEET_ZH_MAP = {
   // other common sheets
   'analysis_text_templates': '分析文本模板',
   'analysis_thresholds': '分析阈值配置',
+  'summary_analysis_items': '汇总分析科目',
+  'summary_exclude_codes': '汇总排除科目',
+  'analysis_code_redirects': '分析编码重定向',
   'bs_checks': '资产负债校验规则',
   'is_checks': '利润表校验规则',
   'cf_checks': '现金流量表校验规则',
@@ -5885,6 +6004,10 @@ const FIELD_ZH_MAP = {
   'scope': '范围',
   'subject_code': '科目编码',
   'subject_name': '科目名称',
+  'summary_code': '汇总编码',
+  'exclude_codes': '排除编码集',
+  'src_code': '源编码',
+  'dst_code': '目标编码',
   'key': '键',
   'value': '值',
   'field': '字段',
