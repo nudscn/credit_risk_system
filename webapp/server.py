@@ -54,6 +54,14 @@ DEFAULT_SUMMARY_ANALYSIS_ITEMS = [
 ]
 SUMMARY_TOP_COVERAGE_TARGET_PCT = 75.0
 SUMMARY_TOP_COVERAGE_TARGET_PCT_INCOME = 90.0
+DEFAULT_SUMMARY_COMPOSITION_POLICY = {
+    "dedup_enabled": 1,
+    "dedup_share_near_pp": 1.0,
+    "dedup_contains_enabled": 1,
+    "dedup_keep_existing_if_contains_ji": 1,
+    "top_max_items": 0,  # 0 = unlimited (coverage driven)
+    "top_delta_max_items": 3,
+}
 DEFAULT_SUMMARY_EXCLUDE_CODES = {
     "SUM001": {"BS004", "BS009", "BS015"},  # 流动资产：排除不同层级科目
     "SUM002": {"BS041", "BS044"},  # 非流动资产：排除不同层级科目
@@ -87,6 +95,7 @@ RULE_EDIT_SOURCES = [
             "analysis_thresholds",
             "summary_analysis_items",
             "summary_exclude_codes",
+            "summary_composition_policy",
             "analysis_code_redirects",
         ],
     },
@@ -100,7 +109,16 @@ RULE_EDIT_SOURCES = [
         "source_id": "ratio_rulebook",
         "label": "财务指标规则（ratio_analysis_rulebook.xlsx）",
         "path": PROJECT_ROOT / "config" / "ratio_analysis_rulebook.xlsx",
-        "sheets": ["indicator_tree", "indicator_catalog", "trend_rules", "judgement_rules", "alert_rules", "text_templates", "display_policy"],
+        "sheets": [
+            "indicator_tree",
+            "indicator_catalog",
+            "trend_rules",
+            "judgement_rules",
+            "alert_rules",
+            "period_applicability",
+            "text_templates",
+            "display_policy",
+        ],
     },
     {
         "source_id": "income_rulebook",
@@ -547,6 +565,45 @@ def _load_analysis_code_redirects() -> Dict[str, Dict[str, str]]:
     return out or default_map
 
 
+def _load_summary_composition_policy() -> Dict[str, Any]:
+    p = PROJECT_ROOT / "config" / "rulebook.xlsx"
+    cfg = dict(DEFAULT_SUMMARY_COMPOSITION_POLICY)
+    if not p.exists():
+        return cfg
+    try:
+        wb = load_workbook(p, data_only=True)
+    except Exception:
+        return cfg
+    ws = get_sheet_by_loose_name(wb, ["summary_composition_policy", "汇总构成策略"])
+    if ws is None:
+        return cfg
+    headers = {str(ws.cell(1, c).value or "").strip(): c for c in range(1, ws.max_column + 1)}
+    c_key = headers.get("key", 1)
+    c_val = headers.get("value", 2)
+    c_enabled = headers.get("enabled", 3)
+    for r in range(2, ws.max_row + 1):
+        enabled = str(ws.cell(r, c_enabled).value or "1").strip().lower()
+        if enabled in {"0", "false", "no", "n"}:
+            continue
+        key = str(ws.cell(r, c_key).value or "").strip()
+        if not key:
+            continue
+        raw = ws.cell(r, c_val).value
+        if key not in cfg:
+            continue
+        dft = cfg[key]
+        try:
+            if isinstance(dft, int):
+                cfg[key] = int(float(raw))
+            elif isinstance(dft, float):
+                cfg[key] = float(raw)
+            else:
+                cfg[key] = raw
+        except Exception:
+            continue
+    return cfg
+
+
 def _save_threshold_config(
     global_scale_pct: float,
     global_struct_pp: float,
@@ -785,6 +842,48 @@ DEFAULT_RATIO_TREE = [
     {"node_id": "3", "parent_id": "", "label_zh": "营运能力分析", "node_type": "group", "indicator_id": "", "enabled": 1, "sort_order": 30},
     {"node_id": "4", "parent_id": "", "label_zh": "现金流与结构分析", "node_type": "group", "indicator_id": "", "enabled": 1, "sort_order": 40},
 ]
+DEFAULT_PERIOD_APPLICABILITY_RULES = [
+    {
+        "rule_id": "PA001",
+        "period_mode": "monitor",
+        "match_type": "indicator_id_contains",
+        "match_value": "turnover",
+        "applicability": "na",
+        "note": "期间口径下周转类指标通常不适用，建议使用完整年度数据分析。",
+        "enabled": 1,
+        "sort_order": 10,
+    },
+    {
+        "rule_id": "PA002",
+        "period_mode": "monitor",
+        "match_type": "indicator_id",
+        "match_value": "roe",
+        "applicability": "na",
+        "note": "期间口径下ROE受季节性和年化口径影响较大，建议以年度分析为主。",
+        "enabled": 1,
+        "sort_order": 20,
+    },
+    {
+        "rule_id": "PA003",
+        "period_mode": "monitor",
+        "match_type": "indicator_id_contains",
+        "match_value": "gross_margin",
+        "applicability": "caution",
+        "note": "期间口径毛利率可用于监测，但建议结合收入结构变化进行谨慎解读。",
+        "enabled": 1,
+        "sort_order": 30,
+    },
+    {
+        "rule_id": "PA999",
+        "period_mode": "monitor",
+        "match_type": "all",
+        "match_value": "*",
+        "applicability": "applicable",
+        "note": "该指标可用于期间监测分析。",
+        "enabled": 1,
+        "sort_order": 999,
+    },
+]
 KEY_RATIO_IDS = {"K1", "K2"}
 DEFAULT_AMOUNT_UNIT = "元"
 
@@ -998,26 +1097,113 @@ def get_sheet_by_loose_name(wb, candidates: List[str]):
 
 
 def parse_years_from_sheet(ws) -> List[str]:
-    """Find years from header rows. Prefer row 3, fallback to row 1-6 scan."""
-    years: List[str] = []
+    """Find period labels from header rows. Prefer row 3, fallback to row 1-6 scan.
+
+    Supported labels include annual and interim periods, e.g.:
+    2024, 2024Q1, 2024H1, 2024Q3.
+    """
+    periods: List[str] = []
 
     def collect_from_row(row_idx: int) -> None:
         for col in range(3, ws.max_column + 1):
             text = str(ws.cell(row_idx, col).value or "")
-            m = re.search(r"(20\d{2})", text)
-            if not m:
+            p = _normalize_period_label(text)
+            if not p:
                 continue
-            y = m.group(1)
-            if y not in years:
-                years.append(y)
+            if p not in periods:
+                periods.append(p)
 
     collect_from_row(3)
-    if not years:
+    if not periods:
         for row_idx in range(1, min(ws.max_row, 6) + 1):
             collect_from_row(row_idx)
-            if years:
+            if periods:
                 break
-    return years[:DEFAULT_YEAR_COUNT]
+    periods = _period_seq(periods)
+    return periods[-DEFAULT_YEAR_COUNT:]
+
+
+def _normalize_period_label(text: Any) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+
+    # Explicit forms like 2025Q1 / 2025H1 / 2025FY / 2025年Q1
+    m = re.search(r"(20\d{2})\s*[年/\-\\.]?\s*(Q[1-4]|H1|FY)", s, re.IGNORECASE)
+    if m:
+        y = m.group(1)
+        t = m.group(2).upper()
+        return y if t == "FY" else f"{y}{t}"
+
+    # Date-like forms: infer period by month.
+    md = re.search(r"(20\d{2})\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})", s)
+    if md:
+        y = md.group(1)
+        month = int(md.group(2))
+        if month <= 3:
+            return f"{y}Q1"
+        if month <= 6:
+            return f"{y}H1"
+        if month <= 9:
+            return f"{y}Q3"
+        return y
+
+    # Year-only fallback.
+    my = re.search(r"(20\d{2})", s)
+    if my:
+        return my.group(1)
+    return ""
+
+
+def _period_sort_key(period_label: str) -> tuple:
+    p = str(period_label or "").strip().upper()
+    m = re.match(r"^(20\d{2})(Q[1-4]|H1)?$", p)
+    if not m:
+        # unknown format goes to end but remains stable by text
+        return (9999, 99, p)
+    year = int(m.group(1))
+    typ = m.group(2) or "FY"
+    order = {"Q1": 1, "H1": 2, "Q3": 3, "FY": 4}.get(typ, 9)
+    return (year, order, p)
+
+
+def _period_seq(periods: List[str]) -> List[str]:
+    seen = set()
+    cleaned: List[str] = []
+    for p in (periods or []):
+        n = _normalize_period_label(p)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        cleaned.append(n)
+    cleaned.sort(key=_period_sort_key)
+    return cleaned
+
+
+def _is_annual_period(period_label: str) -> bool:
+    return bool(re.match(r"^20\d{2}$", str(period_label or "").strip()))
+
+
+def _period_display(period_label: str) -> str:
+    p = str(period_label or "").strip()
+    if not p:
+        return ""
+    return f"{p}年" if _is_annual_period(p) else p
+
+
+def _period_value_prefix(period_label: str) -> str:
+    d = _period_display(period_label)
+    return d if d.endswith("年") else f"{d}期"
+
+
+def _period_pairs(periods: List[str], include_first_last: bool = True) -> List[tuple]:
+    seq = _period_seq(periods)
+    out: List[tuple] = []
+    for i in range(1, len(seq)):
+        out.append((seq[i - 1], seq[i]))
+    if include_first_last and len(seq) >= 3:
+        out.append((seq[0], seq[-1]))
+    return out
 
 
 def _safe_float(v: Any, default: float) -> float:
@@ -1400,6 +1586,7 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
             "indicator_trend": DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend"],
             "indicator_alert": "风险提示：{alert_text}",
         },
+        "period_applicability": list(DEFAULT_PERIOD_APPLICABILITY_RULES),
     }
     if not RATIO_RULEBOOK_PATH.exists():
         return cfg
@@ -1525,6 +1712,46 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
                 }
             )
 
+    ws_pa = get_sheet_by_loose_name(wb, ["period_applicability", "期间适用性矩阵"])
+    if ws_pa is not None:
+        headers = {str(ws_pa.cell(1, c).value or "").strip(): c for c in range(1, ws_pa.max_column + 1)}
+        c_rule = headers.get("rule_id", 1)
+        c_mode = headers.get("period_mode", 2)
+        c_mtype = headers.get("match_type", 3)
+        c_mval = headers.get("match_value", 4)
+        c_app = headers.get("applicability", 5)
+        c_note = headers.get("note", 6)
+        c_enabled = headers.get("enabled", 7)
+        c_sort = headers.get("sort_order", 8)
+        rules: List[Dict[str, Any]] = []
+        for r in range(2, ws_pa.max_row + 1):
+            enabled_raw = str(ws_pa.cell(r, c_enabled).value or "1").strip().lower()
+            if enabled_raw in {"0", "false", "no"}:
+                continue
+            mode = str(ws_pa.cell(r, c_mode).value or "").strip().lower() or "monitor"
+            mtype = str(ws_pa.cell(r, c_mtype).value or "").strip().lower() or "all"
+            mval = str(ws_pa.cell(r, c_mval).value or "").strip()
+            app = str(ws_pa.cell(r, c_app).value or "").strip().lower() or "applicable"
+            if app not in {"applicable", "caution", "na"}:
+                app = "applicable"
+            if mtype not in {"all", "indicator_id", "indicator_id_contains", "name_contains", "group_contains"}:
+                mtype = "all"
+            rules.append(
+                {
+                    "rule_id": str(ws_pa.cell(r, c_rule).value or "").strip(),
+                    "period_mode": mode,
+                    "match_type": mtype,
+                    "match_value": mval,
+                    "applicability": app,
+                    "note": str(ws_pa.cell(r, c_note).value or "").strip(),
+                    "enabled": 1,
+                    "sort_order": _safe_float(ws_pa.cell(r, c_sort).value, 9999),
+                }
+            )
+        if rules:
+            rules.sort(key=lambda x: (_safe_float(x.get("sort_order"), 9999), str(x.get("rule_id", ""))))
+            cfg["period_applicability"] = rules
+
     ws_display = get_sheet_by_loose_name(wb, ["display_policy"])
     if ws_display is not None:
         for r in range(2, ws_display.max_row + 1):
@@ -1575,6 +1802,49 @@ def _sanitize_ratio_tree_nodes(tree_nodes: List[Dict[str, Any]]) -> List[Dict[st
             continue
         out.append(n)
     return out
+
+
+def _detect_period_mode(periods: List[str]) -> str:
+    seq = _period_seq(periods)
+    if seq and all(_is_annual_period(x) for x in seq):
+        return "annual"
+    return "monitor"
+
+
+def _pick_period_applicability(
+    rules: List[Dict[str, Any]],
+    period_mode: str,
+    indicator_id: str,
+    indicator_name: str,
+    group_name: str,
+) -> Dict[str, Any]:
+    pmode = str(period_mode or "").strip().lower() or "monitor"
+    iid = str(indicator_id or "").strip().lower()
+    iname = str(indicator_name or "")
+    gname = str(group_name or "")
+    for r in (rules or []):
+        if str(r.get("period_mode", "")).strip().lower() not in {"", pmode, "all"}:
+            continue
+        mtype = str(r.get("match_type", "all")).strip().lower()
+        mval = str(r.get("match_value", "")).strip()
+        hit = False
+        if mtype == "all":
+            hit = True
+        elif mtype == "indicator_id":
+            hit = iid == mval.lower()
+        elif mtype == "indicator_id_contains":
+            hit = bool(mval) and (mval.lower() in iid)
+        elif mtype == "name_contains":
+            hit = mval and (mval in iname)
+        elif mtype == "group_contains":
+            hit = mval and (mval in gname)
+        if hit:
+            return {
+                "applicability": str(r.get("applicability", "applicable")).strip().lower() or "applicable",
+                "note": str(r.get("note", "")).strip(),
+                "rule_id": str(r.get("rule_id", "")).strip(),
+            }
+    return {"applicability": "applicable", "note": "", "rule_id": ""}
 
 
 def load_key_ratio_text_rules() -> Dict[str, Any]:
@@ -2441,6 +2711,7 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     years = ratio_data.get("years", [])[:3]
     if len(years) < 2:
         return {"sheet_title": ratio_data.get("sheet_title"), "years": years, "tree": [], "nodes": []}
+    period_mode = _detect_period_mode(years)
     rows = ratio_data.get("rows", [])
     ratio_by_code = {str(r.get("code", "")).strip(): r for r in rows}
     ratio_by_name_key = {}
@@ -2457,6 +2728,7 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     judgement_rules = dict(rules.get("judgement_rules", {}))
     alert_rules = list(rules.get("alert_rules", []))
     text_templates = dict(rules.get("text_templates", {}))
+    period_app_rules = list(rules.get("period_applicability", []) or [])
 
     tree = []
     nodes = []
@@ -2519,11 +2791,9 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
         value_tpl = text_templates.get("indicator_value", DEFAULT_TEXT_TEMPLATES["ratio_indicator_value"])
         trend_tpl = text_templates.get("indicator_trend", DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend"])
         seq_years = _year_seq(years)
-        value_parts = [f"{y}年{_fmt_ratio_number(val_map.get(y), unit)}{unit}" for y in seq_years]
+        value_parts = [f"{_period_value_prefix(y)}{_fmt_ratio_number(val_map.get(y), unit)}{unit}" for y in seq_years]
         trend_parts: List[str] = []
-        for i in range(1, len(seq_years)):
-            yp = seq_years[i - 1]
-            yc = seq_years[i]
+        for yp, yc in _period_pairs(seq_years, include_first_last=True):
             pj = _ratio_judgement_parts(
                 val_map.get(yc),
                 val_map.get(yp),
@@ -2532,25 +2802,16 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
                 labels,
                 unit,
             )
-            trend_parts.append(f"{yc}较{yp}{pj['judgement']}（变动{pj['delta']}{pj['unit2']}）")
-        if len(seq_years) >= 3:
-            y_first = seq_years[0]
-            y_last = seq_years[-1]
-            pj_fl = _ratio_judgement_parts(
-                val_map.get(y_last),
-                val_map.get(y_first),
-                cat.get("direction", "higher"),
-                trend_rule,
-                labels,
-                unit,
-            )
-            trend_parts.append(f"{y_last}较{y_first}{pj_fl['judgement']}（变动{pj_fl['delta']}{pj_fl['unit2']}）")
+            trend_parts.append(f"{_period_display(yc)}较{_period_display(yp)}{pj['judgement']}（变动{pj['delta']}{pj['unit2']}）")
         text_ctx = {
             "name": label,
             "unit": unit,
             "y1": y1,
             "y2": y2,
             "y3": y3,
+            "y1_label": _period_display(y1),
+            "y2_label": _period_display(y2),
+            "y3_label": _period_display(y3),
             "v1": _fmt_ratio_number(val_map.get(y1), unit),
             "v2": _fmt_ratio_number(val_map.get(y2), unit),
             "v3": _fmt_ratio_number(val_map.get(y3), unit),
@@ -2563,19 +2824,46 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
             "series_trends": "；".join(trend_parts),
             "y_first": seq_years[0] if seq_years else "",
             "y_last": seq_years[-1] if seq_years else "",
+            "y_first_label": _period_display(seq_years[0]) if seq_years else "",
+            "y_last_label": _period_display(seq_years[-1]) if seq_years else "",
             "y_prev": seq_years[-2] if len(seq_years) >= 2 else (seq_years[-1] if seq_years else ""),
+            "y_prev_label": _period_display(seq_years[-2]) if len(seq_years) >= 2 else (_period_display(seq_years[-1]) if seq_years else ""),
         }
-        if len(seq_years) == 2 and ("{y3}" in value_tpl or "{v3}" in value_tpl):
+        if (len(seq_years) == 2 and ("{y3}" in value_tpl or "{v3}" in value_tpl)) or any(
+            not _is_annual_period(y) for y in seq_years
+        ):
             text1 = f"{label}：{text_ctx['series_values']}。"
         else:
             text1 = _render_template(value_tpl, text_ctx)
-        if len(seq_years) == 2 and ("{y3}" in trend_tpl or "{judgement32}" in trend_tpl or "{delta32}" in trend_tpl):
+        if (len(seq_years) == 2 and ("{y3}" in trend_tpl or "{judgement32}" in trend_tpl or "{delta32}" in trend_tpl)) or any(
+            not _is_annual_period(y) for y in seq_years
+        ):
             text2 = f"{text_ctx['series_trends']}。"
         else:
             text2 = _render_template(trend_tpl, text_ctx)
         alert_text = _ratio_alert_text(iid, val_map, years, unit, alert_rules, text_templates)
         auto_text = _append_text(_append_text(text1, text2), alert_text)
+        pa = _pick_period_applicability(
+            period_app_rules,
+            period_mode=period_mode,
+            indicator_id=iid,
+            indicator_name=str(cat.get("name", "")) or label,
+            group_name=str(cat.get("group", "")),
+        )
+        app = str(pa.get("applicability", "applicable")).strip().lower()
+        app_note = str(pa.get("note", "")).strip()
+        if period_mode == "monitor":
+            if app == "na":
+                auto_text = app_note or "期间口径下该指标不适用，建议切换到年度分析。"
+            elif app == "caution":
+                tip = app_note or "期间口径下该指标需谨慎解读。"
+                auto_text = _append_text(f"【期间谨慎】{tip}", auto_text)
         add_node(nid, parent, label, val_map, str(rec.get("code", "")), str(rec.get("name", "")), auto_text)
+        if nodes:
+            nodes[-1]["period_mode"] = period_mode
+            nodes[-1]["period_applicability"] = app
+            nodes[-1]["period_app_note"] = app_note
+            nodes[-1]["period_app_rule_id"] = str(pa.get("rule_id", ""))
 
     store = load_store(project_id)
     entries = store.get("entries", {})
@@ -2587,7 +2875,7 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
         n["confirmed"] = confirmed
         n["final_text"] = manual if manual.strip() else n["auto_text"]
 
-    return {"sheet_title": ratio_data.get("sheet_title"), "years": years, "tree": tree, "nodes": nodes}
+    return {"sheet_title": ratio_data.get("sheet_title"), "years": years, "period_mode": period_mode, "tree": tree, "nodes": nodes}
 
 
 def build_key_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
@@ -2719,7 +3007,7 @@ def read_ratio_rows(ws) -> Dict[str, Any]:
         elif h == "数值":
             value_col = c
 
-    years_set = set()
+    periods_set = set()
     bucket: Dict[str, Dict[str, Any]] = {}
 
     for r in range(2, ws.max_row + 1):
@@ -2730,17 +3018,16 @@ def read_ratio_rows(ws) -> Dict[str, Any]:
         if not code or not name:
             continue
 
-        m = re.search(r"(20\d{2})", period_text)
-        if not m:
+        period = _normalize_period_label(period_text)
+        if not period:
             continue
-        year = m.group(1)
-        years_set.add(year)
+        periods_set.add(period)
 
         obj = bucket.setdefault(code, {"code": code, "name": name, "values": {}})
         obj["name"] = name
-        obj["values"][year] = value
+        obj["values"][period] = value
 
-    years = sorted(years_set)[:DEFAULT_YEAR_COUNT]
+    years = _period_seq(list(periods_set))[-DEFAULT_YEAR_COUNT:]
     rows = list(bucket.values())
     # Keep sheet rows aligned with indicator catalog:
     # when a new indicator is added in rules, it should appear in ratio table/template automatically.
@@ -3202,26 +3489,19 @@ def _sum_values(items: List[Dict[str, Optional[float]]], years: List[str]) -> Di
 
 
 def _compat_three_periods(years: List[str]) -> tuple:
-    ys = [str(y) for y in (years or []) if str(y).strip()]
+    ys = _period_seq([str(y) for y in (years or []) if str(y).strip()])
     if not ys:
         return "", "", ""
     if len(ys) == 1:
         return ys[0], ys[0], ys[0]
     if len(ys) == 2:
         return ys[0], ys[1], ys[1]
+    ys = ys[-3:]
     return ys[0], ys[1], ys[2]
 
 
 def _year_seq(years: List[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for y in (years or []):
-        ys = str(y).strip()
-        if not ys or ys in seen:
-            continue
-        seen.add(ys)
-        out.append(ys)
-    return out[:3]
+    return _period_seq(years)[-3:]
 
 
 def _fmt_income_auto_text(
@@ -3243,10 +3523,8 @@ def _fmt_income_auto_text(
     for y in seq_years:
         v = values.get(y)
         vt = f"{v:.2f}" if isinstance(v, (int, float)) and v is not None else (str(v) if v is not None else "待补充")
-        value_parts.append(f"{y}年{vt}{unit or ''}")
-    for i in range(1, len(seq_years)):
-        yp = seq_years[i - 1]
-        yc = seq_years[i]
+        value_parts.append(f"{_period_value_prefix(y)}{vt}{unit or ''}")
+    for yp, yc in _period_pairs(seq_years, include_first_last=True):
         t = trend_text(
             values.get(yc),
             values.get(yp),
@@ -3255,27 +3533,22 @@ def _fmt_income_auto_text(
             down_label=str(labels.get("down_label", "减少")),
             stable_label=str(labels.get("stable_label", "保持稳定")),
         )
-        trend_parts.append(f"{yc}较{yp}{t}")
-    if len(seq_years) >= 3:
-        y_first = seq_years[0]
-        y_last = seq_years[-1]
-        tfl = trend_text(
-            values.get(y_last),
-            values.get(y_first),
-            stable_pct=stable_pct,
-            up_label=str(labels.get("up_label", "增加")),
-            down_label=str(labels.get("down_label", "减少")),
-            stable_label=str(labels.get("stable_label", "保持稳定")),
-        )
-        trend_parts.append(f"{y_last}较{y_first}{tfl}")
-    t21 = trend_parts[0].replace(f"{seq_years[1]}较{seq_years[0]}", "", 1) if len(trend_parts) >= 1 and len(seq_years) >= 2 else ""
-    t32 = trend_parts[1].replace(f"{seq_years[2]}较{seq_years[1]}", "", 1) if len(trend_parts) >= 2 and len(seq_years) >= 3 else ""
+        trend_parts.append(f"{_period_display(yc)}较{_period_display(yp)}{t}")
+    t21 = ""
+    t32 = ""
+    if len(seq_years) >= 2 and trend_parts:
+        t21 = trend_parts[0].replace(f"{_period_display(seq_years[1])}较{_period_display(seq_years[0])}", "", 1)
+    if len(seq_years) >= 3 and len(trend_parts) >= 2:
+        t32 = trend_parts[1].replace(f"{_period_display(seq_years[2])}较{_period_display(seq_years[1])}", "", 1)
     tpl = (text_templates or {}).get("income_segment_value", DEFAULT_TEXT_TEMPLATES["income_segment_value"])
     ctx = {
         "label": label,
         "y1": y1,
         "y2": y2,
         "y3": y3,
+        "y1_label": _period_display(y1),
+        "y2_label": _period_display(y2),
+        "y3_label": _period_display(y3),
         "v1": values.get(y1) if values.get(y1) is not None else "待补充",
         "v2": values.get(y2) if values.get(y2) is not None else "待补充",
         "v3": values.get(y3) if values.get(y3) is not None else "待补充",
@@ -3285,10 +3558,16 @@ def _fmt_income_auto_text(
         "series_trends": "；".join(trend_parts),
         "y_first": seq_years[0] if seq_years else "",
         "y_last": seq_years[-1] if seq_years else "",
+        "y_first_label": _period_display(seq_years[0]) if seq_years else "",
+        "y_last_label": _period_display(seq_years[-1]) if seq_years else "",
         "y_prev": seq_years[-2] if len(seq_years) >= 2 else (seq_years[-1] if seq_years else ""),
+        "y_prev_label": _period_display(seq_years[-2]) if len(seq_years) >= 2 else (_period_display(seq_years[-1]) if seq_years else ""),
         "unit": unit or "",
     }
-    if len(seq_years) == 2 and ("{y3}" in tpl or "{v3}" in tpl or "{t32}" in tpl):
+    # Mixed periods should always use generic series rendering to avoid legacy {y1}年 hard-coded templates.
+    if (len(seq_years) == 2 and ("{y3}" in tpl or "{v3}" in tpl or "{t32}" in tpl)) or any(
+        not _is_annual_period(y) for y in seq_years
+    ):
         return f"{label}：{ctx['series_values']}；{ctx['series_trends']}。"
     return _render_template(tpl, ctx)
 
@@ -3357,11 +3636,9 @@ def _fmt_ratio_auto_text(
     labels = trend_labels or {}
     seq_years = _year_seq(years)
     ratio_map = {y: _calc_ratio_pct(numer_values.get(y), denom_values.get(y)) for y in seq_years}
-    value_parts = [f"{y}年{_fmt_pct(ratio_map.get(y))}" for y in seq_years]
+    value_parts = [f"{_period_value_prefix(y)}{_fmt_pct(ratio_map.get(y))}" for y in seq_years]
     trend_parts: List[str] = []
-    for i in range(1, len(seq_years)):
-        yp = seq_years[i - 1]
-        yc = seq_years[i]
+    for yp, yc in _period_pairs(seq_years, include_first_last=True):
         t = _trend_pp_text(
             ratio_map.get(yc),
             ratio_map.get(yp),
@@ -3370,27 +3647,22 @@ def _fmt_ratio_auto_text(
             down_label=str(labels.get("down_label", "下降")),
             stable_label=str(labels.get("stable_label", "基本稳定")),
         )
-        trend_parts.append(f"{yc}较{yp}{t}")
-    if len(seq_years) >= 3:
-        y_first = seq_years[0]
-        y_last = seq_years[-1]
-        tfl = _trend_pp_text(
-            ratio_map.get(y_last),
-            ratio_map.get(y_first),
-            stable_pp=stable_pp,
-            up_label=str(labels.get("up_label", "上升")),
-            down_label=str(labels.get("down_label", "下降")),
-            stable_label=str(labels.get("stable_label", "基本稳定")),
-        )
-        trend_parts.append(f"{y_last}较{y_first}{tfl}")
-    t21 = trend_parts[0].replace(f"{seq_years[1]}较{seq_years[0]}", "", 1) if len(trend_parts) >= 1 and len(seq_years) >= 2 else ""
-    t32 = trend_parts[1].replace(f"{seq_years[2]}较{seq_years[1]}", "", 1) if len(trend_parts) >= 2 and len(seq_years) >= 3 else ""
+        trend_parts.append(f"{_period_display(yc)}较{_period_display(yp)}{t}")
+    t21 = ""
+    t32 = ""
+    if len(seq_years) >= 2 and trend_parts:
+        t21 = trend_parts[0].replace(f"{_period_display(seq_years[1])}较{_period_display(seq_years[0])}", "", 1)
+    if len(seq_years) >= 3 and len(trend_parts) >= 2:
+        t32 = trend_parts[1].replace(f"{_period_display(seq_years[2])}较{_period_display(seq_years[1])}", "", 1)
     tpl = (text_templates or {}).get("income_segment_share", DEFAULT_TEXT_TEMPLATES["income_segment_share"])
     ctx = {
         "ratio_label": ratio_label,
         "y1": y1,
         "y2": y2,
         "y3": y3,
+        "y1_label": _period_display(y1),
+        "y2_label": _period_display(y2),
+        "y3_label": _period_display(y3),
         "r1": _fmt_pct(r1),
         "r2": _fmt_pct(r2),
         "r3": _fmt_pct(r3),
@@ -3412,9 +3684,14 @@ def _fmt_ratio_auto_text(
         "series_trends": "；".join(trend_parts),
         "y_first": seq_years[0] if seq_years else "",
         "y_last": seq_years[-1] if seq_years else "",
+        "y_first_label": _period_display(seq_years[0]) if seq_years else "",
+        "y_last_label": _period_display(seq_years[-1]) if seq_years else "",
         "y_prev": seq_years[-2] if len(seq_years) >= 2 else (seq_years[-1] if seq_years else ""),
+        "y_prev_label": _period_display(seq_years[-2]) if len(seq_years) >= 2 else (_period_display(seq_years[-1]) if seq_years else ""),
     }
-    if len(seq_years) == 2 and ("{y3}" in tpl or "{r3}" in tpl or "{rt32}" in tpl):
+    if (len(seq_years) == 2 and ("{y3}" in tpl or "{r3}" in tpl or "{rt32}" in tpl)) or any(
+        not _is_annual_period(y) for y in seq_years
+    ):
         return f"{ratio_label}：{ctx['series_values']}；{ctx['series_trends']}。"
     return _render_template(tpl, ctx)
 
@@ -4535,9 +4812,21 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
             return _render_template(sum_tpl.get("summary_pp_down", "下降{value}个百分点"), {"value": f"{abs(delta):.2f}"})
         return _render_template(sum_tpl.get("summary_pp_stable", "基本稳定（变动{value}个百分点）"), {"value": f"{abs(delta):.2f}"})
 
-    def _top_migration_text(total_vals: Dict[str, Optional[float]], comps: List[Dict[str, Any]], coverage_target_pct: float = 75.0) -> str:
+    def _top_migration_text(
+        total_vals: Dict[str, Optional[float]],
+        comps: List[Dict[str, Any]],
+        coverage_target_pct: float = 75.0,
+        policy: Optional[Dict[str, Any]] = None,
+    ) -> str:
         if len(years) < 2:
             return _render_template(sum_tpl.get("summary_top_missing", "结构迁移分析待补充。"), {})
+        policy = dict(policy or {})
+        dedup_enabled = bool(int(policy.get("dedup_enabled", 1) or 0))
+        dedup_share_near_pp = float(policy.get("dedup_share_near_pp", 1.0) or 1.0)
+        dedup_contains_enabled = bool(int(policy.get("dedup_contains_enabled", 1) or 0))
+        dedup_keep_existing_if_contains_ji = bool(int(policy.get("dedup_keep_existing_if_contains_ji", 1) or 0))
+        top_max_items = int(policy.get("top_max_items", 0) or 0)
+        top_delta_max_items = int(policy.get("top_delta_max_items", 3) or 3)
         y1, y_last = years[0], years[-1]
         t1 = total_vals.get(y1)
         t_last = total_vals.get(y_last)
@@ -4555,30 +4844,41 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
         if not latest:
             return _render_template(sum_tpl.get("summary_top_missing", "结构迁移分析待补充。"), {})
         latest.sort(key=lambda x: float(x.get("s_last") or 0.0), reverse=True)
-        # Remove overlapping duplicates (e.g., "固定资产(合计)" vs "固定资产", "应收票据及应收账款" vs "应收账款").
-        dedup_latest: List[Dict[str, Any]] = []
-        for x in latest:
-            n = str(x.get("name_norm", ""))
-            s = float(x.get("s_last") or 0.0)
-            dup = False
-            for k in dedup_latest:
-                nk = str(k.get("name_norm", ""))
-                sk = float(k.get("s_last") or 0.0)
-                if not n or not nk:
-                    continue
-                overlap = (n in nk) or (nk in n)
-                near_share = abs(s - sk) <= 1.0
-                if overlap and (near_share or ("及" in str(k.get("name", "")))):
-                    dup = True
-                    break
-            if not dup:
-                dedup_latest.append(x)
-        latest = dedup_latest
+        if dedup_enabled:
+            # Remove overlapping duplicates (e.g., "固定资产(合计)" vs "固定资产", "应收票据及应收账款" vs "应收账款").
+            dedup_latest: List[Dict[str, Any]] = []
+            for x in latest:
+                n = str(x.get("name_norm", ""))
+                s = float(x.get("s_last") or 0.0)
+                dup = False
+                for k in dedup_latest:
+                    nk = str(k.get("name_norm", ""))
+                    sk = float(k.get("s_last") or 0.0)
+                    if not n or not nk:
+                        continue
+                    overlap = (n in nk) or (nk in n)
+                    if not overlap:
+                        continue
+                    near_share = abs(s - sk) <= dedup_share_near_pp
+                    contains_rule = False
+                    if dedup_contains_enabled:
+                        if dedup_keep_existing_if_contains_ji:
+                            contains_rule = "及" in str(k.get("name", ""))
+                        else:
+                            contains_rule = True
+                    if near_share or contains_rule:
+                        dup = True
+                        break
+                if not dup:
+                    dedup_latest.append(x)
+            latest = dedup_latest
         selected: List[Dict[str, Any]] = []
         cum = 0.0
         for x in latest:
             selected.append(x)
-            cum += float(x.get("s3") or 0.0)
+            cum += float(x.get("s_last") or 0.0)
+            if top_max_items > 0 and len(selected) >= top_max_items:
+                break
             if cum >= coverage_target_pct:
                 break
         top_txt = "、".join([f"{x['name']}（{_fmt_pct(x.get('s_last'))}）" for x in selected])
@@ -4594,7 +4894,8 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
             move_bits.append(f"{down['name']}占比下降{abs(float(down['d'])):.2f}个百分点")
             move_names.add(str(down["name"]))
         top_delta_bits = []
-        for x in selected[:3]:
+        selected_for_delta = selected if top_delta_max_items <= 0 else selected[:top_delta_max_items]
+        for x in selected_for_delta:
             if str(x["name"]) in move_names:
                 continue
             top_delta_bits.append(f"{x['name']}占比{_up_down_pp(x.get('d'))}")
@@ -4640,6 +4941,7 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
 
     summary_items = _load_summary_analysis_items()
     summary_excludes = _load_summary_exclude_codes()
+    summary_policy = _load_summary_composition_policy()
     for item in summary_items:
         code = str(item["code"])
         name = str(item["name"])
@@ -4871,7 +5173,7 @@ def build_summary_analysis_payload(wb, project_id: str) -> Dict[str, Any]:
             comps = _build_income_components()
         if comps and code in {"SUM001", "SUM002", "SUM004", "SUM005", "SUM007"}:
             target_pct = top_coverage_income if code == "SUM007" else top_coverage_default
-            rel_text = rel_text + "\n" + _top_migration_text(values, comps, coverage_target_pct=target_pct)
+            rel_text = rel_text + "\n" + _top_migration_text(values, comps, coverage_target_pct=target_pct, policy=summary_policy)
 
         struct_rows.append(
             {
@@ -5157,7 +5459,7 @@ def generate_auto_text(name: str, values: Dict[str, Optional[float]], years: Lis
     if len(years) < 2:
         return _render_template(
             tpl.get("sheet_auto_one_year", DEFAULT_TEXT_TEMPLATES["sheet_auto_one_year"]),
-            {"name": name, "latest": latest, "latest_val": f"{latest_val:,.2f}"},
+            {"name": name, "latest": latest, "latest_label": _period_display(latest), "latest_val": f"{latest_val:,.2f}"},
         )
 
     prev = years[-2]
@@ -5165,7 +5467,7 @@ def generate_auto_text(name: str, values: Dict[str, Optional[float]], years: Lis
     if prev_val in (None, 0):
         return _render_template(
             tpl.get("sheet_auto_prev_missing", DEFAULT_TEXT_TEMPLATES["sheet_auto_prev_missing"]),
-            {"name": name, "latest": latest, "latest_val": f"{latest_val:,.2f}"},
+            {"name": name, "latest": latest, "latest_label": _period_display(latest), "latest_val": f"{latest_val:,.2f}"},
         )
 
     diff = latest_val - prev_val
@@ -5176,7 +5478,9 @@ def generate_auto_text(name: str, values: Dict[str, Optional[float]], years: Lis
         {
             "name": name,
             "latest": latest,
+            "latest_label": _period_display(latest),
             "prev": prev,
+            "prev_label": _period_display(prev),
             "latest_val": f"{latest_val:,.2f}",
             "direction": direction,
             "abs_diff": f"{abs(diff):,.2f}",
@@ -5244,6 +5548,21 @@ def _read_rule_sheet(source_id: str, sheet_name: str) -> Dict[str, Any]:
     wb = load_workbook(p, data_only=False)
     ws = get_sheet_by_loose_name(wb, [sheet_name])
     if ws is None:
+        if source_id == "ratio_rulebook" and sheet_name == "period_applicability":
+            headers = ["rule_id", "period_mode", "match_type", "match_value", "applicability", "note", "enabled", "sort_order"]
+            rows = []
+            for i, r in enumerate(DEFAULT_PERIOD_APPLICABILITY_RULES, start=2):
+                obj = {"_row": i}
+                for h in headers:
+                    obj[h] = r.get(h)
+                rows.append(obj)
+            return {
+                "source_id": source_id,
+                "sheet_name": sheet_name,
+                "path": str(p),
+                "headers": headers,
+                "rows": rows,
+            }
         raise ValueError(f"sheet not found: {sheet_name}")
     headers = [str(ws.cell(1, c).value or "").strip() for c in range(1, ws.max_column + 1)]
     if not any(headers):
@@ -5322,7 +5641,10 @@ def _save_rule_sheet(source_id: str, sheet_name: str, headers: List[str], rows: 
     wb = load_workbook(p, data_only=False)
     ws = get_sheet_by_loose_name(wb, [sheet_name])
     if ws is None:
-        raise ValueError(f"sheet not found: {sheet_name}")
+        if source_id == "ratio_rulebook" and sheet_name == "period_applicability":
+            ws = wb.create_sheet(sheet_name)
+        else:
+            raise ValueError(f"sheet not found: {sheet_name}")
     issues = _validate_rule_rows(sheet_name, headers, rows)
     has_error = any(x.get("level") == "error" for x in issues)
     if has_error:
@@ -5787,7 +6109,7 @@ let ratioRuleSheet = '';
 let activeRow = -1;
 let pendingLocate = null;
 const RATIO_OVERALL_SHEETS = ['indicator_tree', 'indicator_catalog'];
-const RATIO_RULE_SHEETS = ['trend_rules', 'judgement_rules', 'alert_rules', 'display_policy', 'text_templates'];
+const RATIO_RULE_SHEETS = ['trend_rules', 'judgement_rules', 'alert_rules', 'period_applicability', 'display_policy', 'text_templates'];
 const DEFAULT_SHEET_BY_SOURCE = {
   ratio_rulebook: 'text_templates',
   profit_rulebook: 'analysis_text_templates',
@@ -5935,6 +6257,7 @@ const SHEET_ZH_MAP = {
   'analysis_thresholds': '分析阈值配置',
   'summary_analysis_items': '汇总分析科目',
   'summary_exclude_codes': '汇总排除科目',
+  'summary_composition_policy': '汇总构成策略',
   'analysis_code_redirects': '分析编码重定向',
   'bs_checks': '资产负债校验规则',
   'is_checks': '利润表校验规则',
@@ -5945,6 +6268,7 @@ const SHEET_ZH_MAP = {
   'trend_rules': '趋势规则',
   'judgement_rules': '判断词规则',
   'alert_rules': '预警规则',
+  'period_applicability': '期间适用性矩阵',
   'driver_thresholds': '驱动阈值',
   'narrative_templates': '叙述模板'
 };
@@ -6015,6 +6339,11 @@ const FIELD_ZH_MAP = {
   'sort_order': '排序',
   'unit': '单位',
   'direction': '方向'
+  ,'period_mode': '期间模式'
+  ,'match_type': '匹配类型'
+  ,'match_value': '匹配值'
+  ,'applicability': '适用性'
+  ,'note': '提示语'
 };
 const METRIC_ZH_MAP = {
   'rev_yoy': '收入同比变动',
@@ -6100,7 +6429,8 @@ function renderAlertExprHelp(){
   `;
 }
 function indicatorApplicable(){
-  return isRatioSource() && isRatioRuleSheet(activeSheetName());
+  const s = activeSheetName();
+  return isRatioSource() && isRatioRuleSheet(s) && s !== 'period_applicability';
 }
 function rowIndicatorId(row){
   const iid = String(row?.indicator_id ?? '').trim();
@@ -6855,7 +7185,10 @@ function renderTree() {{
   box.innerHTML = tree.map(n => {{
     const d = depthOf(n.node_id);
     const active = n.node_id === activeNodeId ? 'active' : '';
-    return `<div class="node ${{active}}" data-id="${{esc(n.node_id)}}" style="padding-left:${{10 + d * 16}}px;">${{esc(n.node_id)}} ${{esc(n.label)}}</div>`;
+    const nd = nodeById(n.node_id) || {{}};
+    const app = String(nd.period_applicability || '').toLowerCase();
+    const tag = app === 'na' ? ' [不适用]' : (app === 'caution' ? ' [谨慎]' : '');
+    return `<div class="node ${{active}}" data-id="${{esc(n.node_id)}}" style="padding-left:${{10 + d * 16}}px;">${{esc(n.node_id)}} ${{esc(n.label)}}${{esc(tag)}}</div>`;
   }}).join('');
   box.querySelectorAll('.node[data-id]').forEach(el => {{
     el.addEventListener('click', () => {{
@@ -7024,7 +7357,10 @@ function renderNode() {{
   renderTree();
   const n = nodeById(activeNodeId);
   if (!n) return;
-  document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析）`;
+  const app = String(n.period_applicability || '').toLowerCase();
+  const mode = String(n.period_mode || cache.period_mode || '');
+  const appTag = app === 'na' ? '不适用' : (app === 'caution' ? '谨慎' : '可用');
+  document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析｜${{mode==='monitor'?'期间监测':'年度分析'}}｜${{appTag}}）`;
   document.getElementById('autoText').textContent = n.auto_text || '';
   document.getElementById('manualText').value = n.manual_text || n.auto_text || '';
   document.getElementById('manualConfirmed').checked = !!n.confirmed;
@@ -7063,7 +7399,7 @@ async function reloadData() {{
     activeNodeId = cache.tree[0].node_id;
   }}
   renderNode();
-  document.getElementById('status').textContent = `来源Sheet: ${{cache.sheet_title || '-'}} | 年份: ${{(cache.years||[]).join(',')}}`;
+  document.getElementById('status').textContent = `来源Sheet: ${{cache.sheet_title || '-'}} | 期间: ${{(cache.years||[]).join(',')}} | 模式: ${{cache.period_mode==='monitor'?'期间监测':'年度分析'}}`;
 }}
 reloadData();
 </script>
