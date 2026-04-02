@@ -83,6 +83,7 @@ INCOME_RULEBOOK_FALLBACK_PATH = PROJECT_ROOT / "config" / "rulebook.xlsx"
 RATIO_RULEBOOK_PATH = PROJECT_ROOT / "config" / "ratio_analysis_rulebook.xlsx"
 KEY_RATIO_RULEBOOK_PATH = PROJECT_ROOT / "config" / "key_ratio_rulebook.xlsx"
 VALIDATION_RULEBOOK_PATH = PROJECT_ROOT / "config" / "validation_rulebook.xlsx"
+FINANCING_RULEBOOK_PATH = PROJECT_ROOT / "config" / "financing_rulebook.xlsx"
 RULE_WARNING_LOG: List[Dict[str, Any]] = []
 RULE_WARNING_KEYS: set = set()
 RULE_EDIT_SOURCES = [
@@ -115,7 +116,6 @@ RULE_EDIT_SOURCES = [
             "trend_rules",
             "judgement_rules",
             "alert_rules",
-            "period_applicability",
             "text_templates",
             "display_policy",
         ],
@@ -842,48 +842,6 @@ DEFAULT_RATIO_TREE = [
     {"node_id": "3", "parent_id": "", "label_zh": "营运能力分析", "node_type": "group", "indicator_id": "", "enabled": 1, "sort_order": 30},
     {"node_id": "4", "parent_id": "", "label_zh": "现金流与结构分析", "node_type": "group", "indicator_id": "", "enabled": 1, "sort_order": 40},
 ]
-DEFAULT_PERIOD_APPLICABILITY_RULES = [
-    {
-        "rule_id": "PA001",
-        "period_mode": "monitor",
-        "match_type": "indicator_id_contains",
-        "match_value": "turnover",
-        "applicability": "na",
-        "note": "期间口径下周转类指标通常不适用，建议使用完整年度数据分析。",
-        "enabled": 1,
-        "sort_order": 10,
-    },
-    {
-        "rule_id": "PA002",
-        "period_mode": "monitor",
-        "match_type": "indicator_id",
-        "match_value": "roe",
-        "applicability": "na",
-        "note": "期间口径下ROE受季节性和年化口径影响较大，建议以年度分析为主。",
-        "enabled": 1,
-        "sort_order": 20,
-    },
-    {
-        "rule_id": "PA003",
-        "period_mode": "monitor",
-        "match_type": "indicator_id_contains",
-        "match_value": "gross_margin",
-        "applicability": "caution",
-        "note": "期间口径毛利率可用于监测，但建议结合收入结构变化进行谨慎解读。",
-        "enabled": 1,
-        "sort_order": 30,
-    },
-    {
-        "rule_id": "PA999",
-        "period_mode": "monitor",
-        "match_type": "all",
-        "match_value": "*",
-        "applicability": "applicable",
-        "note": "该指标可用于期间监测分析。",
-        "enabled": 1,
-        "sort_order": 999,
-    },
-]
 KEY_RATIO_IDS = {"K1", "K2"}
 DEFAULT_AMOUNT_UNIT = "元"
 
@@ -907,6 +865,13 @@ DEFAULT_TEXT_TEMPLATES = {
     "profit_summary_line_zero": "{name}：影响中性，{net_attr_label}{net_attr_pct}。",
     "ratio_indicator_value": "{name}：{series_values}。",
     "ratio_indicator_trend": "{series_trends}。",
+    "ratio_indicator_value_full_3y": "{name}：{series_values}。",
+    "ratio_indicator_trend_full_3y": "{series_trends}。",
+    "ratio_indicator_value_full_2y": "{name}：{series_values}。",
+    "ratio_indicator_trend_full_2y": "{series_trends}。",
+    "ratio_indicator_value_full_2y_plus_interim": "{name}：{series_values}。",
+    "ratio_indicator_trend_full_2y_plus_interim": "{series_trends}。",
+    "ratio_indicator_downgrade_to_full_2y_note": "期间口径下该指标不适用，已自动按完整年度数据降级分析（{y1}、{y2}）。",
     "key_roe_factors": "净利率：{y1}年{nm1}，{y2}年{nm2}，{y3}年{nm3}；总资产周转率：{y1}年{at1}，{y2}年{at2}，{y3}年{at3}；权益乘数：{y1}年{em1}，{y2}年{em2}，{y3}年{em3}。",
     "key_gm_top_segments": "最新年度分项贡献（按收入占比/分项毛利率）：{top_txt}。",
     "summary_abs_line": "{name}：{y1}年{v1}{unit}，{y2}年{v2}{unit}，{y3}年{v3}{unit}；{y2}较{y1}{p21}，{y3}较{y2}{p32}。",
@@ -943,6 +908,8 @@ DEFAULT_KEY_DRIVER_THRESHOLDS = {
 _KEY_RATIO_RULES_CACHE: Optional[Dict[str, Any]] = None
 _MAIN_TEXT_TEMPLATE_CACHE: Optional[Dict[str, str]] = None
 _MAIN_TEXT_TEMPLATE_UNIT_CACHE: Optional[Dict[str, str]] = None
+_FINANCING_RULES_CACHE: Optional[Dict[str, Any]] = None
+_FINANCING_RULES_CACHE_MTIME: Optional[float] = None
 
 
 def load_main_analysis_text_templates() -> Dict[str, str]:
@@ -1204,6 +1171,27 @@ def _period_pairs(periods: List[str], include_first_last: bool = True) -> List[t
     if include_first_last and len(seq) >= 3:
         out.append((seq[0], seq[-1]))
     return out
+
+
+def _select_analysis_periods_for_group(group_id: str, periods: List[str]) -> List[str]:
+    """
+    Route analysis periods by module:
+    - bs: keep latest 3 periods (including interim as the 3rd slot if present)
+    - is/cf: annual-only; if has 3 annual use 3y, if 2 annual use 2y
+    - others: default latest 3 normalized periods
+    """
+    gid = str(group_id or "").strip().lower()
+    seq = _period_seq(periods)
+    if gid == "bs":
+        return seq[-3:]
+    if gid in {"is", "cf"}:
+        annual = [x for x in seq if _is_annual_period(x)]
+        if len(annual) >= 3:
+            return annual[-3:]
+        if len(annual) >= 2:
+            return annual[-2:]
+        return annual[-1:] if annual else seq[-2:]
+    return seq[-3:]
 
 
 def _safe_float(v: Any, default: float) -> float:
@@ -1584,9 +1572,15 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
         "text_templates": {
             "indicator_value": DEFAULT_TEXT_TEMPLATES["ratio_indicator_value"],
             "indicator_trend": DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend"],
+            "ratio_indicator_value_full_3y": DEFAULT_TEXT_TEMPLATES["ratio_indicator_value_full_3y"],
+            "ratio_indicator_trend_full_3y": DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend_full_3y"],
+            "ratio_indicator_value_full_2y": DEFAULT_TEXT_TEMPLATES["ratio_indicator_value_full_2y"],
+            "ratio_indicator_trend_full_2y": DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend_full_2y"],
+            "ratio_indicator_value_full_2y_plus_interim": DEFAULT_TEXT_TEMPLATES["ratio_indicator_value_full_2y_plus_interim"],
+            "ratio_indicator_trend_full_2y_plus_interim": DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend_full_2y_plus_interim"],
+            "ratio_indicator_downgrade_to_full_2y_note": DEFAULT_TEXT_TEMPLATES["ratio_indicator_downgrade_to_full_2y_note"],
             "indicator_alert": "风险提示：{alert_text}",
         },
-        "period_applicability": list(DEFAULT_PERIOD_APPLICABILITY_RULES),
     }
     if not RATIO_RULEBOOK_PATH.exists():
         return cfg
@@ -1621,6 +1615,7 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
     ws_cat = get_sheet_by_loose_name(wb, ["indicator_catalog"])
     if ws_cat is not None:
         headers = {str(ws_cat.cell(1, c).value or "").strip(): c for c in range(1, ws_cat.max_column + 1)}
+        c_period_app = headers.get("period_applicable")
         for r in range(2, ws_cat.max_row + 1):
             rid = str(ws_cat.cell(r, headers.get("indicator_id", 1)).value or "").strip()
             if not rid:
@@ -1628,6 +1623,12 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
             enabled = str(ws_cat.cell(r, headers.get("enabled", 8)).value or "1").strip().lower()
             if enabled in {"0", "false", "no"}:
                 continue
+            if c_period_app:
+                cell_val = ws_cat.cell(r, c_period_app).value
+                raw_period_app = str("1" if cell_val is None else cell_val).strip().lower()
+                period_applicable = 0 if raw_period_app in {"0", "false", "no", "n"} else 1
+            else:
+                period_applicable = _default_ratio_period_applicable(rid)
             cfg["catalog"][rid] = {
                 "name": str(ws_cat.cell(r, headers.get("indicator_name_zh", 2)).value or rid).strip(),
                 "group": str(ws_cat.cell(r, headers.get("group_zh", 3)).value or "").strip(),
@@ -1635,6 +1636,7 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
                 "unit": str(ws_cat.cell(r, headers.get("unit", 5)).value or "").strip(),
                 "value_source": str(ws_cat.cell(r, headers.get("value_source", 6)).value or "").strip(),
                 "formula_expr": str(ws_cat.cell(r, headers.get("formula_expr", 7)).value or "").strip(),
+                "period_applicable": period_applicable,
             }
 
     ws_trend = get_sheet_by_loose_name(wb, ["trend_rules"])
@@ -1712,46 +1714,6 @@ def load_ratio_analysis_rules() -> Dict[str, Any]:
                 }
             )
 
-    ws_pa = get_sheet_by_loose_name(wb, ["period_applicability", "期间适用性矩阵"])
-    if ws_pa is not None:
-        headers = {str(ws_pa.cell(1, c).value or "").strip(): c for c in range(1, ws_pa.max_column + 1)}
-        c_rule = headers.get("rule_id", 1)
-        c_mode = headers.get("period_mode", 2)
-        c_mtype = headers.get("match_type", 3)
-        c_mval = headers.get("match_value", 4)
-        c_app = headers.get("applicability", 5)
-        c_note = headers.get("note", 6)
-        c_enabled = headers.get("enabled", 7)
-        c_sort = headers.get("sort_order", 8)
-        rules: List[Dict[str, Any]] = []
-        for r in range(2, ws_pa.max_row + 1):
-            enabled_raw = str(ws_pa.cell(r, c_enabled).value or "1").strip().lower()
-            if enabled_raw in {"0", "false", "no"}:
-                continue
-            mode = str(ws_pa.cell(r, c_mode).value or "").strip().lower() or "monitor"
-            mtype = str(ws_pa.cell(r, c_mtype).value or "").strip().lower() or "all"
-            mval = str(ws_pa.cell(r, c_mval).value or "").strip()
-            app = str(ws_pa.cell(r, c_app).value or "").strip().lower() or "applicable"
-            if app not in {"applicable", "caution", "na"}:
-                app = "applicable"
-            if mtype not in {"all", "indicator_id", "indicator_id_contains", "name_contains", "group_contains"}:
-                mtype = "all"
-            rules.append(
-                {
-                    "rule_id": str(ws_pa.cell(r, c_rule).value or "").strip(),
-                    "period_mode": mode,
-                    "match_type": mtype,
-                    "match_value": mval,
-                    "applicability": app,
-                    "note": str(ws_pa.cell(r, c_note).value or "").strip(),
-                    "enabled": 1,
-                    "sort_order": _safe_float(ws_pa.cell(r, c_sort).value, 9999),
-                }
-            )
-        if rules:
-            rules.sort(key=lambda x: (_safe_float(x.get("sort_order"), 9999), str(x.get("rule_id", ""))))
-            cfg["period_applicability"] = rules
-
     ws_display = get_sheet_by_loose_name(wb, ["display_policy"])
     if ws_display is not None:
         for r in range(2, ws_display.max_row + 1):
@@ -1811,40 +1773,18 @@ def _detect_period_mode(periods: List[str]) -> str:
     return "monitor"
 
 
-def _pick_period_applicability(
-    rules: List[Dict[str, Any]],
-    period_mode: str,
-    indicator_id: str,
-    indicator_name: str,
-    group_name: str,
-) -> Dict[str, Any]:
-    pmode = str(period_mode or "").strip().lower() or "monitor"
-    iid = str(indicator_id or "").strip().lower()
-    iname = str(indicator_name or "")
-    gname = str(group_name or "")
-    for r in (rules or []):
-        if str(r.get("period_mode", "")).strip().lower() not in {"", pmode, "all"}:
-            continue
-        mtype = str(r.get("match_type", "all")).strip().lower()
-        mval = str(r.get("match_value", "")).strip()
-        hit = False
-        if mtype == "all":
-            hit = True
-        elif mtype == "indicator_id":
-            hit = iid == mval.lower()
-        elif mtype == "indicator_id_contains":
-            hit = bool(mval) and (mval.lower() in iid)
-        elif mtype == "name_contains":
-            hit = mval and (mval in iname)
-        elif mtype == "group_contains":
-            hit = mval and (mval in gname)
-        if hit:
-            return {
-                "applicability": str(r.get("applicability", "applicable")).strip().lower() or "applicable",
-                "note": str(r.get("note", "")).strip(),
-                "rule_id": str(r.get("rule_id", "")).strip(),
-            }
-    return {"applicability": "applicable", "note": "", "rule_id": ""}
+def _detect_ratio_data_shape(periods: List[str]) -> str:
+    seq = _period_seq(periods)
+    if len(seq) >= 3:
+        seq = seq[-3:]
+    annual_cnt = sum(1 for x in seq if _is_annual_period(x))
+    if len(seq) == 3 and annual_cnt == 3:
+        return "full_3y"
+    if len(seq) == 2 and annual_cnt == 2:
+        return "full_2y"
+    if len(seq) == 3 and annual_cnt == 2:
+        return "full_2y_plus_interim"
+    return "mixed"
 
 
 def load_key_ratio_text_rules() -> Dict[str, Any]:
@@ -1932,6 +1872,487 @@ def load_key_ratio_text_rules() -> Dict[str, Any]:
         cfg["templates"] = merged
     _KEY_RATIO_RULES_CACHE = cfg
     return cfg
+
+
+DEFAULT_FINANCING_BASE_PARAMS: List[Dict[str, Any]] = [
+    {"param_id": "target_revenue", "label_zh": "目标营业收入", "value": 300000.0, "unit": "万元", "group": "规模", "enabled": 1, "notes": "可设为当前规模或目标规模"},
+    {"param_id": "operating_cost_ratio", "label_zh": "营业成本率（采购/生产）", "value": 0.78, "unit": "ratio", "group": "规模", "enabled": 1, "notes": "营业成本/收入"},
+    {"param_id": "variable_expense_ratio", "label_zh": "变动费用率", "value": 0.06, "unit": "ratio", "group": "规模", "enabled": 1, "notes": "按收入比例变动的费用率"},
+    {"param_id": "fixed_expense_amount", "label_zh": "固定费用金额", "value": 3000.0, "unit": "万元", "group": "规模", "enabled": 1, "notes": "与收入不直接同比变动的费用"},
+    {"param_id": "gross_margin_pct", "label_zh": "毛利率", "value": 0.22, "unit": "ratio", "group": "规模", "enabled": 1, "notes": "用于校验口径"},
+    {"param_id": "inventory_days", "label_zh": "存货周转天数", "value": 120.0, "unit": "天", "group": "周期", "enabled": 1, "notes": ""},
+    {"param_id": "receivable_days", "label_zh": "应收周转天数", "value": 90.0, "unit": "天", "group": "周期", "enabled": 1, "notes": ""},
+    {"param_id": "payable_days", "label_zh": "应付周转天数", "value": 75.0, "unit": "天", "group": "周期", "enabled": 1, "notes": ""},
+    {"param_id": "safety_buffer_ratio", "label_zh": "安全垫资比例", "value": 0.03, "unit": "ratio", "group": "周期", "enabled": 1, "notes": "按目标收入比例计提预备资金"},
+    {"param_id": "occ_match_tolerance_ratio", "label_zh": "占用匹配容差", "value": 0.15, "unit": "ratio", "group": "判定", "enabled": 1, "notes": "A/B落在[1-容差,1+容差]判为基本匹配"},
+    {"param_id": "current_equity_funds", "label_zh": "可用资本金", "value": 50000.0, "unit": "万元", "group": "供给", "enabled": 1, "notes": ""},
+    {"param_id": "current_operating_occupation", "label_zh": "经营性占款（稳定）", "value": 30000.0, "unit": "万元", "group": "供给", "enabled": 1, "notes": "如长期稳定应付款占用"},
+    {"param_id": "current_stable_loans", "label_zh": "稳定融资（中长期）", "value": 60000.0, "unit": "万元", "group": "供给", "enabled": 1, "notes": ""},
+    {"param_id": "current_other_funding", "label_zh": "其他融资余额", "value": 25000.0, "unit": "万元", "group": "供给", "enabled": 1, "notes": "短贷/票据/其他"},
+    {"param_id": "current_payable_occupation", "label_zh": "应付款占用余额", "value": 18000.0, "unit": "万元", "group": "供给", "enabled": 1, "notes": "用于结构替换测算"},
+]
+DEFAULT_FINANCING_STRUCTURE_TARGETS: List[Dict[str, Any]] = [
+    {"source_id": "equity", "source_name": "资本金", "target_pct": 0.30, "min_pct": 0.20, "max_pct": 0.45, "enabled": 1, "notes": ""},
+    {"source_id": "occupation", "source_name": "经营性占款", "target_pct": 0.20, "min_pct": 0.10, "max_pct": 0.35, "enabled": 1, "notes": ""},
+    {"source_id": "stable_loan", "source_name": "稳定融资", "target_pct": 0.35, "min_pct": 0.20, "max_pct": 0.50, "enabled": 1, "notes": ""},
+    {"source_id": "other", "source_name": "其他融资", "target_pct": 0.15, "min_pct": 0.05, "max_pct": 0.30, "enabled": 1, "notes": ""},
+]
+DEFAULT_FINANCING_ADJUSTMENT_RULES: List[Dict[str, Any]] = [
+    {"rule_id": "replace_payable", "label_zh": "应付款替换比例", "value": 0.30, "unit": "ratio", "enabled": 1, "notes": "应付款占用中拟替换为稳定贷款的比例"},
+    {"rule_id": "short_long_shift", "label_zh": "短转长比例", "value": 0.25, "unit": "ratio", "enabled": 1, "notes": "其他融资中建议转中长期比例"},
+]
+DEFAULT_FINANCING_TEXT_TEMPLATES: Dict[str, str] = {
+    "summary_header": "融资测算结果：资金需求总量{demand_total}万元，自我覆盖资金{self_cover}万元，融资缺口{funding_gap}万元。",
+    "summary_gap_positive": "存在新增融资需求，建议优先补充稳定融资并优化期限结构。",
+    "summary_gap_non_positive": "总量层面无新增缺口，建议重点进行存量结构重构。",
+    "summary_adjustment": "建议结构调整总量约{adjustment_total}万元，其中应付款替换{replace_payable_amt}万元、短转长{short_long_shift_amt}万元。",
+    "occ_match_word_high": "占用偏高",
+    "occ_match_word_low": "占用偏低",
+    "occ_match_word_ok": "基本匹配",
+}
+
+
+def load_financing_rules() -> Dict[str, Any]:
+    global _FINANCING_RULES_CACHE, _FINANCING_RULES_CACHE_MTIME
+    current_mtime = FINANCING_RULEBOOK_PATH.stat().st_mtime if FINANCING_RULEBOOK_PATH.exists() else None
+    if isinstance(_FINANCING_RULES_CACHE, dict) and _FINANCING_RULES_CACHE_MTIME == current_mtime:
+        return _FINANCING_RULES_CACHE
+
+    cfg: Dict[str, Any] = {
+        "base_params": [dict(x) for x in DEFAULT_FINANCING_BASE_PARAMS],
+        "structure_targets": [dict(x) for x in DEFAULT_FINANCING_STRUCTURE_TARGETS],
+        "adjustment_rules": [dict(x) for x in DEFAULT_FINANCING_ADJUSTMENT_RULES],
+        "text_templates": dict(DEFAULT_FINANCING_TEXT_TEMPLATES),
+    }
+    if not FINANCING_RULEBOOK_PATH.exists():
+        _FINANCING_RULES_CACHE = cfg
+        _FINANCING_RULES_CACHE_MTIME = None
+        return cfg
+    try:
+        wb = load_workbook(FINANCING_RULEBOOK_PATH, data_only=True)
+    except Exception:
+        _FINANCING_RULES_CACHE = cfg
+        _FINANCING_RULES_CACHE_MTIME = current_mtime
+        return cfg
+
+    def _enabled(v: Any) -> bool:
+        t = str("1" if v is None else v).strip().lower()
+        return t not in {"0", "false", "no", "n"}
+
+    ws_base = get_sheet_by_loose_name(wb, ["base_params"])
+    if ws_base is not None:
+        headers = {str(ws_base.cell(1, c).value or "").strip(): c for c in range(1, ws_base.max_column + 1)}
+        out: List[Dict[str, Any]] = []
+        defaults_by_pid = {str(x.get("param_id", "")).strip(): dict(x) for x in DEFAULT_FINANCING_BASE_PARAMS}
+        for r in range(2, ws_base.max_row + 1):
+            if not _enabled(ws_base.cell(r, headers.get("enabled", 6)).value):
+                continue
+            pid = str(ws_base.cell(r, headers.get("param_id", 1)).value or "").strip()
+            if not pid:
+                continue
+            if pid == "cash_cost_ratio":
+                # Backward compatibility: old field name.
+                pid = "operating_cost_ratio"
+            val = _safe_float(ws_base.cell(r, headers.get("value", 3)).value, None)
+            label = str(ws_base.cell(r, headers.get("label_zh", 2)).value or "").strip()
+            unit = str(ws_base.cell(r, headers.get("unit", 4)).value or "").strip()
+            group = str(ws_base.cell(r, headers.get("group", 5)).value or "").strip()
+            notes = str(ws_base.cell(r, headers.get("notes", 7)).value or "").strip()
+            dft = defaults_by_pid.get(pid, {})
+            if not label or "?" in label:
+                label = str(dft.get("label_zh", pid))
+            if not unit or "?" in unit:
+                unit = str(dft.get("unit", ""))
+            if not group or "?" in group:
+                group = str(dft.get("group", ""))
+            if (not notes or "?" in notes) and dft.get("notes"):
+                notes = str(dft.get("notes", ""))
+            out.append(
+                {
+                    "param_id": pid,
+                    "label_zh": label or pid,
+                    "value": float(val) if val is not None else 0.0,
+                    "unit": unit,
+                    "group": group,
+                    "enabled": 1,
+                    "notes": notes,
+                }
+            )
+        if out:
+            seen: set = set()
+            norm: List[Dict[str, Any]] = []
+            for x in out:
+                pid = str(x.get("param_id", "")).strip()
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                norm.append(x)
+            for pid in [
+                "operating_cost_ratio",
+                "variable_expense_ratio",
+                "fixed_expense_amount",
+                "safety_buffer_ratio",
+                "occ_match_tolerance_ratio",
+            ]:
+                if pid in seen:
+                    continue
+                dft = defaults_by_pid.get(pid)
+                if dft:
+                    norm.append(dict(dft))
+            cfg["base_params"] = norm
+
+    ws_target = get_sheet_by_loose_name(wb, ["structure_targets"])
+    if ws_target is not None:
+        headers = {str(ws_target.cell(1, c).value or "").strip(): c for c in range(1, ws_target.max_column + 1)}
+        out = []
+        for r in range(2, ws_target.max_row + 1):
+            if not _enabled(ws_target.cell(r, headers.get("enabled", 6)).value):
+                continue
+            sid = str(ws_target.cell(r, headers.get("source_id", 1)).value or "").strip()
+            if not sid:
+                continue
+            out.append(
+                {
+                    "source_id": sid,
+                    "source_name": str(ws_target.cell(r, headers.get("source_name", 2)).value or "").strip() or sid,
+                    "target_pct": float(_safe_float(ws_target.cell(r, headers.get("target_pct", 3)).value, 0.0)),
+                    "min_pct": float(_safe_float(ws_target.cell(r, headers.get("min_pct", 4)).value, 0.0)),
+                    "max_pct": float(_safe_float(ws_target.cell(r, headers.get("max_pct", 5)).value, 1.0)),
+                    "enabled": 1,
+                    "notes": str(ws_target.cell(r, headers.get("notes", 7)).value or "").strip(),
+                }
+            )
+        if out:
+            cfg["structure_targets"] = out
+
+    ws_adj = get_sheet_by_loose_name(wb, ["adjustment_rules"])
+    if ws_adj is not None:
+        headers = {str(ws_adj.cell(1, c).value or "").strip(): c for c in range(1, ws_adj.max_column + 1)}
+        out = []
+        for r in range(2, ws_adj.max_row + 1):
+            if not _enabled(ws_adj.cell(r, headers.get("enabled", 5)).value):
+                continue
+            rid = str(ws_adj.cell(r, headers.get("rule_id", 1)).value or "").strip()
+            if not rid:
+                continue
+            out.append(
+                {
+                    "rule_id": rid,
+                    "label_zh": str(ws_adj.cell(r, headers.get("label_zh", 2)).value or "").strip() or rid,
+                    "value": float(_safe_float(ws_adj.cell(r, headers.get("value", 3)).value, 0.0)),
+                    "unit": str(ws_adj.cell(r, headers.get("unit", 4)).value or "").strip(),
+                    "enabled": 1,
+                    "notes": str(ws_adj.cell(r, headers.get("notes", 6)).value or "").strip(),
+                }
+            )
+        if out:
+            cfg["adjustment_rules"] = out
+
+    ws_txt = get_sheet_by_loose_name(wb, ["text_templates"])
+    if ws_txt is not None:
+        headers = {str(ws_txt.cell(1, c).value or "").strip(): c for c in range(1, ws_txt.max_column + 1)}
+        merged = dict(cfg["text_templates"])
+        for r in range(2, ws_txt.max_row + 1):
+            if not _enabled(ws_txt.cell(r, headers.get("enabled", 3)).value):
+                continue
+            k = str(ws_txt.cell(r, headers.get("template_key", 1)).value or "").strip()
+            v = str(ws_txt.cell(r, headers.get("template_text", 2)).value or "").strip()
+            if k and _is_valid_text_cell(v):
+                merged[k] = v
+        cfg["text_templates"] = merged
+
+    _FINANCING_RULES_CACHE = cfg
+    _FINANCING_RULES_CACHE_MTIME = current_mtime
+    return cfg
+
+
+def build_financing_analysis_payload(project_id: str, wb=None) -> Dict[str, Any]:
+    rules = load_financing_rules()
+    tpl = dict(rules.get("text_templates", {}) or {})
+    params_base = [dict(x) for x in (rules.get("base_params", []) or [])]
+    store = load_store(project_id)
+    fin_inputs = get_financing_inputs(store)
+    param_values = fin_inputs.get("param_values", {}) if isinstance(fin_inputs.get("param_values"), dict) else {}
+    struct_adjust_amt = fin_inputs.get("structure_adjust_amt", {}) if isinstance(fin_inputs.get("structure_adjust_amt"), dict) else {}
+    struct_current_amt_store = (
+        fin_inputs.get("structure_current_amt", {}) if isinstance(fin_inputs.get("structure_current_amt"), dict) else {}
+    )
+    occ_amount_store = fin_inputs.get("occupation_amounts", {}) if isinstance(fin_inputs.get("occupation_amounts"), dict) else {}
+    match_word_store = fin_inputs.get("match_words", {}) if isinstance(fin_inputs.get("match_words"), dict) else {}
+
+    auto_defaults: Dict[str, float] = {}
+    actual_occ: Dict[str, Any] = {
+        "period": "",
+        "components": [],
+        "total": 0.0,
+    }
+    own_wb = False
+    if wb is None:
+        wb_path = workbook_path(project_id)
+        if wb_path.exists():
+            wb = load_workbook(wb_path, data_only=False)
+            own_wb = True
+    if wb is not None:
+        auto_defaults = _derive_financing_defaults_from_workbook(wb, project_id)
+        actual_occ = _derive_actual_occupation_from_workbook(wb, project_id)
+    if own_wb and wb is not None:
+        wb.close()
+    # Apply project-level manual overrides for actual occupation components.
+    comps = actual_occ.get("components", []) if isinstance(actual_occ.get("components"), list) else []
+    for comp in comps:
+        iid = str(comp.get("item_id", "")).strip()
+        if not iid:
+            continue
+        mv = _safe_float(occ_amount_store.get(iid), None)
+        if mv is not None:
+            comp["amount"] = round(float(mv), 2)
+    actual_occ["components"] = comps
+    actual_occ["total"] = round(sum(float(_safe_float(x.get("amount"), 0.0)) for x in comps), 2)
+    match_words = {
+        "high": str(match_word_store.get("high", "") or tpl.get("occ_match_word_high", "占用偏高")),
+        "low": str(match_word_store.get("low", "") or tpl.get("occ_match_word_low", "占用偏低")),
+        "ok": str(match_word_store.get("ok", "") or tpl.get("occ_match_word_ok", "基本匹配")),
+    }
+
+    explain_map = {
+        "operating_cost_ratio": "营业成本率=采购/生产成本占收入比例，用于测算采购链资金占用。",
+        "variable_expense_ratio": "变动费用率=与收入同向变动的费用占收入比例（如运输、销售佣金等）。",
+        "fixed_expense_amount": "固定费用金额=与收入不同比变动的费用总额（如工资、租金、管理等）。",
+        "safety_buffer_ratio": "安全垫资比例=按目标收入提取的预备资金比例，用于应对临时流动性需求。",
+        "occ_match_tolerance_ratio": "占用匹配容差=按A/B判定“基本匹配”的容忍区间（默认±15%）。",
+    }
+
+    params_rows: List[Dict[str, Any]] = []
+    p_current: Dict[str, float] = {}
+    p_target: Dict[str, float] = {}
+    for r in params_base:
+        pid = str(r.get("param_id", "")).strip()
+        if not pid:
+            continue
+        grp = str(r.get("group", "")).strip()
+        if grp == "供给":
+            # Supply amounts are maintained in "资金结构" section, not base parameters.
+            continue
+        base_val = float(_safe_float(r.get("value"), 0.0))
+        auto_val = auto_defaults.get(pid, base_val)
+        pv = param_values.get(pid, {}) if isinstance(param_values.get(pid), dict) else {}
+        current_val = float(_safe_float(pv.get("current"), auto_val))
+        target_val = float(_safe_float(pv.get("target"), current_val))
+        p_current[pid] = current_val
+        p_target[pid] = target_val
+        params_rows.append(
+            {
+                "param_id": pid,
+                "group": grp,
+                "label_zh": str(r.get("label_zh", pid)),
+                "current_value": round(current_val, 6),
+                "target_value": round(target_val, 6),
+                "unit": str(r.get("unit", "")),
+                "notes": explain_map.get(pid, str(r.get("notes", ""))),
+            }
+        )
+
+    # Demand side uses target values
+    target_revenue = p_target.get("target_revenue", 0.0)
+    operating_cost_ratio = p_target.get("operating_cost_ratio", 0.0)
+    variable_expense_ratio = p_target.get("variable_expense_ratio", 0.0)
+    fixed_expense_amount = p_target.get("fixed_expense_amount", 0.0)
+    inv_days = p_target.get("inventory_days", 0.0)
+    ar_days = p_target.get("receivable_days", 0.0)
+    ap_days = p_target.get("payable_days", 0.0)
+    safety_buffer_ratio = p_target.get("safety_buffer_ratio", 0.0)
+    demand_cycle_days = inv_days + ar_days
+    daily_operating_cost = target_revenue * operating_cost_ratio / 365.0 if target_revenue and operating_cost_ratio else 0.0
+    daily_variable_expense = (
+        target_revenue * variable_expense_ratio / 365.0 if target_revenue and variable_expense_ratio else 0.0
+    )
+    daily_fixed_expense = fixed_expense_amount / 365.0 if fixed_expense_amount else 0.0
+    variable_expense_amount = target_revenue * variable_expense_ratio if target_revenue and variable_expense_ratio else 0.0
+    fixed_expense_occupied = daily_fixed_expense * max(0.0, demand_cycle_days)
+    safety_buffer_amount = max(0.0, target_revenue * max(0.0, safety_buffer_ratio))
+    demand_total = (
+        (daily_operating_cost + daily_variable_expense) * max(0.0, demand_cycle_days)
+        + fixed_expense_occupied
+        + safety_buffer_amount
+    )
+    gross_profit_amount = target_revenue * (1.0 - operating_cost_ratio) if target_revenue else 0.0
+    expense_total_amount = variable_expense_amount + fixed_expense_amount
+    gp_cover_ratio = (gross_profit_amount / expense_total_amount) if expense_total_amount > 0 else None
+
+    # Supply side uses current values
+    current_amounts_auto = {
+        "equity": float(_safe_float(auto_defaults.get("current_equity_funds"), 0.0)),
+        "occupation": float(_safe_float(auto_defaults.get("current_operating_occupation"), 0.0)),
+        "stable_loan": float(_safe_float(auto_defaults.get("current_stable_loans"), 0.0)),
+        "other": float(_safe_float(auto_defaults.get("current_other_funding"), 0.0)),
+    }
+    current_amounts = {
+        sid: float(_safe_float(struct_current_amt_store.get(sid), current_amounts_auto.get(sid, 0.0)))
+        for sid in ["equity", "occupation", "stable_loan", "other"]
+    }
+    source_name = {"equity": "资本金", "occupation": "经营性占款", "stable_loan": "稳定融资", "other": "其他融资"}
+    total_current = sum(current_amounts.values())
+    self_cover = current_amounts["equity"] + current_amounts["occupation"] + current_amounts["stable_loan"]
+    funding_gap = demand_total - self_cover
+    total_target_amt = 0.0
+
+    structure_rows: List[Dict[str, Any]] = []
+    adjustment_total = 0.0
+    for sid in ["equity", "occupation", "stable_loan", "other"]:
+        cur_amt = float(current_amounts.get(sid, 0.0))
+        adjust_amt = float(_safe_float(struct_adjust_amt.get(sid), 0.0))
+        tgt_amt = cur_amt + adjust_amt
+        adjustment_total += abs(adjust_amt)
+        total_target_amt += max(0.0, tgt_amt)
+        structure_rows.append(
+            {
+                "source_id": sid,
+                "source_name": source_name.get(sid, sid),
+                "current_amt": round(cur_amt, 2),
+                "adjust_amt": round(adjust_amt, 2),
+                "target_amt": round(tgt_amt, 2),
+            }
+        )
+    for x in structure_rows:
+        ca = float(x.get("current_amt", 0.0))
+        ta = float(x.get("target_amt", 0.0))
+        x["current_pct"] = round((ca / total_current * 100.0) if total_current > 0 else 0.0, 2)
+        x["target_pct"] = round((ta / total_target_amt * 100.0) if total_target_amt > 0 else 0.0, 2)
+        x["delta_amt"] = round(ta - ca, 2)
+
+    # Reasonability checks (hard + soft)
+    checks: List[Dict[str, Any]] = []
+    target_sum = sum(float(x.get("target_pct", 0.0)) for x in structure_rows)
+    sum_diff = abs(target_sum - 100.0) if total_target_amt > 0 else 100.0
+    checks.append(
+        {
+            "item": "目标结构合计校验",
+            "status": "通过" if sum_diff <= 0.5 else "关注",
+            "message": f"目标结构合计为{target_sum:.2f}%（偏差{sum_diff:.2f}%）。",
+        }
+    )
+    bound_bad = [x for x in structure_rows if float(x.get("target_amt", 0.0)) < 0]
+    checks.append(
+        {
+            "item": "单项目标边界校验",
+            "status": "通过" if not bound_bad else "不通过",
+            "message": "存在目标金额为负值的来源项。" if bound_bad else "各来源目标金额均非负。",
+        }
+    )
+    delta_warn = [x for x in structure_rows if abs(float(x.get("adjust_amt", 0.0))) > max(20000.0, 0.2 * total_current)]
+    checks.append(
+        {
+            "item": "变动幅度校验",
+            "status": "关注" if delta_warn else "通过",
+            "message": "存在单项调整金额较大，建议补充可行性说明。" if delta_warn else "单项调整金额在可控区间内。",
+        }
+    )
+    actual_total = float(_safe_float(actual_occ.get("total"), 0.0))
+    match_diff = actual_total - demand_total
+    match_ratio = (actual_total / demand_total) if demand_total > 0 else None
+    occ_tol = abs(float(_safe_float(p_target.get("occ_match_tolerance_ratio", 0.15), 0.15)))
+    occ_low = 1.0 - occ_tol
+    occ_high = 1.0 + occ_tol
+    if match_ratio is None:
+        match_status = "待判断"
+    elif match_ratio > occ_high:
+        match_status = match_words.get("high", "占用偏高")
+    elif match_ratio < occ_low:
+        match_status = match_words.get("low", "占用偏低")
+    else:
+        match_status = match_words.get("ok", "基本匹配")
+    checks.append(
+        {
+            "item": "实际占用与理论需求匹配",
+            "status": "通过" if (match_ratio is not None and occ_low <= match_ratio <= occ_high) else "关注",
+            "message": (
+                f"A={actual_total:.2f}万元，B={demand_total:.2f}万元，A-B={match_diff:.2f}万元，"
+                + (f"A/B={match_ratio*100:.2f}%。" if match_ratio is not None else "A/B待判断。")
+                + f"判定：{match_status}（阈值区间{occ_low*100:.2f}%~{occ_high*100:.2f}%）。"
+            ),
+        }
+    )
+    if expense_total_amount <= 0:
+        checks.append(
+            {
+                "item": "毛利覆盖费用校验",
+                "status": "关注",
+                "message": "费用口径为0或缺失，暂无法判断毛利覆盖能力。",
+            }
+        )
+    else:
+        checks.append(
+            {
+                "item": "毛利覆盖费用校验",
+                "status": "通过" if gp_cover_ratio is not None and gp_cover_ratio >= 1.0 else "不通过",
+                "message": (
+                    f"毛利额{gross_profit_amount:.2f}万元，费用合计{expense_total_amount:.2f}万元，覆盖倍数{(gp_cover_ratio or 0.0):.2f}x。"
+                ),
+            }
+        )
+    if funding_gap <= 0 and any(float(x.get("adjust_amt", 0.0)) > 0 for x in structure_rows if x.get("source_id") == "other"):
+        checks.append(
+            {
+                "item": "总量-结构一致性提示",
+                "status": "关注",
+                "message": "总量无缺口但“其他融资”目标上调，建议说明替换逻辑（期限/成本/可获得性）。",
+            }
+        )
+
+    summary_header = _render_template(
+        tpl.get("summary_header", DEFAULT_FINANCING_TEXT_TEMPLATES["summary_header"]),
+        {"demand_total": f"{demand_total:.2f}", "self_cover": f"{self_cover:.2f}", "funding_gap": f"{funding_gap:.2f}"},
+    )
+    summary_main = tpl.get(
+        "summary_gap_positive" if funding_gap > 0 else "summary_gap_non_positive",
+        DEFAULT_FINANCING_TEXT_TEMPLATES["summary_gap_positive" if funding_gap > 0 else "summary_gap_non_positive"],
+    )
+    summary_adjust = _render_template(
+        tpl.get("summary_adjustment", DEFAULT_FINANCING_TEXT_TEMPLATES["summary_adjustment"]),
+        {
+            "adjustment_total": f"{adjustment_total:.2f}",
+            "replace_payable_amt": f"{max(0.0, float(_safe_float(struct_adjust_amt.get('occupation'), 0.0))):.2f}",
+            "short_long_shift_amt": f"{max(0.0, float(_safe_float(struct_adjust_amt.get('other'), 0.0))):.2f}",
+        },
+    )
+
+    return {
+        "project_id": project_id,
+        "params": params_rows,
+        "metrics": {
+            "demand_cycle_days": round(demand_cycle_days, 2),
+            "payable_days": round(ap_days, 2),
+            "daily_operating_cost": round(daily_operating_cost, 2),
+            "variable_expense_amount": round(variable_expense_amount, 2),
+            "fixed_expense_amount": round(fixed_expense_amount, 2),
+            "fixed_expense_occupied": round(fixed_expense_occupied, 2),
+            "gross_profit_amount": round(gross_profit_amount, 2),
+            "expense_total_amount": round(expense_total_amount, 2),
+            "gp_cover_ratio": round(gp_cover_ratio, 4) if gp_cover_ratio is not None else None,
+            "safety_buffer_amount": round(safety_buffer_amount, 2),
+            "demand_total": round(demand_total, 2),
+            "self_cover": round(self_cover, 2),
+            "funding_gap": round(funding_gap, 2),
+            "structure_base": round(total_target_amt, 2),
+            "adjustment_total": round(adjustment_total, 2),
+        },
+        "occupation_match": {
+            "period": str(actual_occ.get("period", "") or ""),
+            "components": actual_occ.get("components", []) or [],
+            "actual_total": round(actual_total, 2),
+            "theoretical_total": round(demand_total, 2),
+            "match_diff": round(match_diff, 2),
+            "match_ratio": round(match_ratio * 100.0, 2) if match_ratio is not None else None,
+            "status": match_status,
+            "tolerance_ratio": round(occ_tol, 6),
+            "word_high": match_words.get("high", ""),
+            "word_low": match_words.get("low", ""),
+            "word_ok": match_words.get("ok", ""),
+        },
+        "structure_plan": structure_rows,
+        "checks": checks,
+        "summary_text": _append_text(_append_text(summary_header, summary_main), summary_adjust),
+    }
 
 
 def _fmt_ratio_value(v: Optional[float], unit: str) -> str:
@@ -2690,7 +3111,13 @@ def _gross_margin_topic_text(wb, rows: List[Dict[str, Any]], years: List[str], k
         {"top_txt": top_txt},
     )
     extra = ""
-    mixed_sign = any((x.get("gross_values", {}) or {}).get(y3, 0) > 0 for x in segs) and any((x.get("gross_values", {}) or {}).get(y3, 0) < 0 for x in segs)
+    def _safe_num(v: Any) -> float:
+        n = normalize_num(v)
+        return float(n) if n is not None else 0.0
+
+    mixed_sign = any(_safe_num((x.get("gross_values", {}) or {}).get(y3)) > 0 for x in segs) and any(
+        _safe_num((x.get("gross_values", {}) or {}).get(y3)) < 0 for x in segs
+    )
     if gp_total.get(y3) is not None and gp_total.get(y3) < 0 or mixed_sign:
         extra = _render_template(
             tpl.get("gm_negative_profit_case", "在总毛利为负或分项正负并存情况下，采用影响占比口径：{impact_summary}。"),
@@ -2712,6 +3139,7 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     if len(years) < 2:
         return {"sheet_title": ratio_data.get("sheet_title"), "years": years, "tree": [], "nodes": []}
     period_mode = _detect_period_mode(years)
+    data_shape = _detect_ratio_data_shape(years)
     rows = ratio_data.get("rows", [])
     ratio_by_code = {str(r.get("code", "")).strip(): r for r in rows}
     ratio_by_name_key = {}
@@ -2728,7 +3156,6 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     judgement_rules = dict(rules.get("judgement_rules", {}))
     alert_rules = list(rules.get("alert_rules", []))
     text_templates = dict(rules.get("text_templates", {}))
-    period_app_rules = list(rules.get("period_applicability", []) or [])
 
     tree = []
     nodes = []
@@ -2769,8 +3196,16 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
         rec = rec or {}
         vals = rec.get("values", {}) if isinstance(rec.get("values"), dict) else {}
         val_map = {y: vals.get(y) for y in years}
-        y1, y2, y3 = _compat_three_periods(years)
         unit = cat.get("unit", "%")
+        period_ok = bool(int(cat.get("period_applicable", 1) or 0))
+        all_seq_years = _year_seq(years)
+        annual_seq_years = [y for y in all_seq_years if _is_annual_period(y)]
+        analysis_years = list(all_seq_years)
+        downgraded_to_annual = False
+        if period_mode == "monitor" and (not period_ok) and len(annual_seq_years) >= 2:
+            analysis_years = annual_seq_years[-2:]
+            downgraded_to_annual = True
+        y1, y2, y3 = _compat_three_periods(analysis_years)
         trend_rule = _select_ratio_trend_rule(
             trend_rules,
             iid,
@@ -2788,9 +3223,16 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
         labels = judgement_rules.get(cat.get("direction", "higher"), {})
         p21 = _ratio_judgement_parts(val_map.get(y2), val_map.get(y1), cat.get("direction", "higher"), trend_rule, labels, unit)
         p32 = _ratio_judgement_parts(val_map.get(y3), val_map.get(y2), cat.get("direction", "higher"), trend_rule, labels, unit)
-        value_tpl = text_templates.get("indicator_value", DEFAULT_TEXT_TEMPLATES["ratio_indicator_value"])
-        trend_tpl = text_templates.get("indicator_trend", DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend"])
-        seq_years = _year_seq(years)
+        active_shape = "full_2y" if downgraded_to_annual else _detect_ratio_data_shape(analysis_years)
+        value_tpl = text_templates.get(
+            f"ratio_indicator_value_{active_shape}",
+            text_templates.get("indicator_value", DEFAULT_TEXT_TEMPLATES["ratio_indicator_value"]),
+        )
+        trend_tpl = text_templates.get(
+            f"ratio_indicator_trend_{active_shape}",
+            text_templates.get("indicator_trend", DEFAULT_TEXT_TEMPLATES["ratio_indicator_trend"]),
+        )
+        seq_years = _year_seq(analysis_years)
         value_parts = [f"{_period_value_prefix(y)}{_fmt_ratio_number(val_map.get(y), unit)}{unit}" for y in seq_years]
         trend_parts: List[str] = []
         for yp, yc in _period_pairs(seq_years, include_first_last=True):
@@ -2841,29 +3283,32 @@ def build_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
             text2 = f"{text_ctx['series_trends']}。"
         else:
             text2 = _render_template(trend_tpl, text_ctx)
-        alert_text = _ratio_alert_text(iid, val_map, years, unit, alert_rules, text_templates)
+        alert_text = _ratio_alert_text(iid, val_map, analysis_years, unit, alert_rules, text_templates)
         auto_text = _append_text(_append_text(text1, text2), alert_text)
-        pa = _pick_period_applicability(
-            period_app_rules,
-            period_mode=period_mode,
-            indicator_id=iid,
-            indicator_name=str(cat.get("name", "")) or label,
-            group_name=str(cat.get("group", "")),
-        )
-        app = str(pa.get("applicability", "applicable")).strip().lower()
-        app_note = str(pa.get("note", "")).strip()
-        if period_mode == "monitor":
-            if app == "na":
-                auto_text = app_note or "期间口径下该指标不适用，建议切换到年度分析。"
-            elif app == "caution":
-                tip = app_note or "期间口径下该指标需谨慎解读。"
-                auto_text = _append_text(f"【期间谨慎】{tip}", auto_text)
+        app = "applicable" if (period_mode == "annual" or period_ok) else "na"
+        app_note = "该指标仅适用于完整年度分析。"
+        if period_mode == "monitor" and not period_ok:
+            if downgraded_to_annual and len(analysis_years) >= 2:
+                auto_text = _append_text(
+                    _render_template(
+                        text_templates.get(
+                            "ratio_indicator_downgrade_to_full_2y_note",
+                            DEFAULT_TEXT_TEMPLATES["ratio_indicator_downgrade_to_full_2y_note"],
+                        ),
+                        {"y1": analysis_years[0], "y2": analysis_years[-1]},
+                    ),
+                    auto_text,
+                )
+            else:
+                auto_text = app_note
         add_node(nid, parent, label, val_map, str(rec.get("code", "")), str(rec.get("name", "")), auto_text)
         if nodes:
             nodes[-1]["period_mode"] = period_mode
+            nodes[-1]["data_shape"] = data_shape
+            nodes[-1]["active_shape"] = active_shape
             nodes[-1]["period_applicability"] = app
             nodes[-1]["period_app_note"] = app_note
-            nodes[-1]["period_app_rule_id"] = str(pa.get("rule_id", ""))
+            nodes[-1]["period_app_rule_id"] = ""
 
     store = load_store(project_id)
     entries = store.get("entries", {})
@@ -2886,6 +3331,13 @@ def build_key_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     ratio_data = read_ratio_rows(ws)
     years = ratio_data.get("years", [])[:3]
     rows = ratio_data.get("rows", [])
+    period_mode = _detect_period_mode(years)
+    data_shape = _detect_ratio_data_shape(years)
+    all_seq_years = _year_seq(years)
+    annual_seq_years = [y for y in all_seq_years if _is_annual_period(y)]
+
+    ratio_rules = load_ratio_analysis_rules()
+    ratio_catalog = ratio_rules.get("catalog", {}) if isinstance(ratio_rules.get("catalog"), dict) else {}
 
     tree = [
         {"node_id": "K1", "parent_id": "", "label": "ROE重点分析"},
@@ -2893,8 +3345,52 @@ def build_key_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
     ]
 
     key_rules = load_key_ratio_text_rules()
-    roe_text = _dupont_topic_text(rows, years, key_rules)
-    gm_text = _gross_margin_topic_text(wb, rows, years, key_rules)
+    # Keep key module aligned with ratio module routing:
+    # - period_mode driven by ratio period labels
+    # - period_applicable driven by indicator_catalog.period_applicable
+    def _indicator_period_ok(indicator_id: str) -> bool:
+        iid = str(indicator_id or "").strip().lower()
+        rec = ratio_catalog.get(iid, {})
+        try:
+            return bool(int(rec.get("period_applicable", _default_ratio_period_applicable(iid)) or 0))
+        except Exception:
+            return bool(_default_ratio_period_applicable(iid))
+
+    def _select_analysis_years(indicator_id: str) -> tuple[List[str], bool]:
+        period_ok = _indicator_period_ok(indicator_id)
+        ys = list(all_seq_years)
+        downgraded = False
+        if period_mode == "monitor" and (not period_ok) and len(annual_seq_years) >= 2:
+            ys = annual_seq_years[-2:]
+            downgraded = True
+        return ys, downgraded
+
+    roe_years, roe_downgraded = _select_analysis_years("roe")
+    gm_years, gm_downgraded = _select_analysis_years("gross_margin")
+    roe_text = _dupont_topic_text(rows, roe_years, key_rules)
+    gm_text = _gross_margin_topic_text(wb, rows, gm_years, key_rules)
+    if period_mode == "monitor" and roe_downgraded and len(roe_years) >= 2:
+        roe_text = _append_text(
+            _render_template(
+                ratio_rules.get("text_templates", {}).get(
+                    "ratio_indicator_downgrade_to_full_2y_note",
+                    DEFAULT_TEXT_TEMPLATES["ratio_indicator_downgrade_to_full_2y_note"],
+                ),
+                {"y1": roe_years[0], "y2": roe_years[-1]},
+            ),
+            roe_text,
+        )
+    if period_mode == "monitor" and gm_downgraded and len(gm_years) >= 2:
+        gm_text = _append_text(
+            _render_template(
+                ratio_rules.get("text_templates", {}).get(
+                    "ratio_indicator_downgrade_to_full_2y_note",
+                    DEFAULT_TEXT_TEMPLATES["ratio_indicator_downgrade_to_full_2y_note"],
+                ),
+                {"y1": gm_years[0], "y2": gm_years[-1]},
+            ),
+            gm_text,
+        )
     nodes = [
         {
             "node_id": "K1",
@@ -2902,8 +3398,15 @@ def build_key_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
             "label": "ROE重点分析",
             "source_code": "roe",
             "source_name": "净资产收益率",
-            "values": {y: None for y in years},
+            "values": {y: None for y in roe_years},
             "auto_text": roe_text,
+            "period_mode": period_mode,
+            "data_shape": data_shape,
+            "analysis_years": roe_years,
+            "active_shape": "full_2y" if roe_downgraded else _detect_ratio_data_shape(roe_years),
+            "period_applicability": "applicable" if (period_mode == "annual" or _indicator_period_ok("roe")) else "na",
+            "period_app_note": "该指标仅适用于完整年度分析。",
+            "period_app_rule_id": "",
         },
         {
             "node_id": "K2",
@@ -2911,8 +3414,15 @@ def build_key_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
             "label": "毛利率重点分析",
             "source_code": "gross_margin",
             "source_name": "销售毛利率",
-            "values": {y: None for y in years},
+            "values": {y: None for y in gm_years},
             "auto_text": gm_text,
+            "period_mode": period_mode,
+            "data_shape": data_shape,
+            "analysis_years": gm_years,
+            "active_shape": "full_2y" if gm_downgraded else _detect_ratio_data_shape(gm_years),
+            "period_applicability": "applicable" if (period_mode == "annual" or _indicator_period_ok("gross_margin")) else "na",
+            "period_app_note": "该指标仅适用于完整年度分析。",
+            "period_app_rule_id": "",
         },
     ]
     # Hard guard: key page only renders dedicated K1/K2 nodes.
@@ -2929,7 +3439,7 @@ def build_key_ratio_analysis_map(wb, project_id: str) -> Dict[str, Any]:
         n["confirmed"] = confirmed
         n["final_text"] = manual if manual.strip() else n["auto_text"]
 
-    return {"sheet_title": ratio_data.get("sheet_title"), "years": years, "tree": tree, "nodes": nodes}
+    return {"sheet_title": ratio_data.get("sheet_title"), "years": years, "period_mode": period_mode, "tree": tree, "nodes": nodes}
 
 
 def _ratio_indicator_catalog_rows() -> List[Dict[str, Any]]:
@@ -2945,6 +3455,7 @@ def _ratio_indicator_catalog_rows() -> List[Dict[str, Any]]:
                 "direction": str(c.get("direction", "")).strip(),
                 "value_source": str(c.get("value_source", "")).strip(),
                 "formula_expr": str(c.get("formula_expr", "")).strip(),
+                "period_applicable": int(c.get("period_applicable", 1) or 0),
             }
         )
     out = [x for x in out if x.get("indicator_id")]
@@ -2958,6 +3469,21 @@ def _norm_metric_name_key(text: Any) -> str:
         return ""
     s = re.sub(r"[\s\(\)（）:：,，、\.\-_/]+", "", s)
     return s
+
+
+def _default_ratio_period_applicable(indicator_id: str) -> int:
+    iid = str(indicator_id or "").strip().lower()
+    # Indicators strongly tied to full-year profit/efficiency are annual-only by default.
+    annual_only = {
+        "interest_coverage",
+        "roe",
+        "roa",
+        "net_margin",
+        "ar_turnover",
+        "inventory_turnover",
+        "asset_turnover",
+    }
+    return 0 if iid in annual_only else 1
 
 
 def _detect_project_years_for_ratio(project_id: str, wb=None) -> List[str]:
@@ -3077,7 +3603,7 @@ def read_sheet_rows(wb, group: Dict[str, Any], project_id: Optional[str] = None)
         for i, year in enumerate(years):
             vals[year] = normalize_num(ws.cell(r, 3 + i).value)
 
-        rows.append({"code": code, "name": name, "values": vals})
+        rows.append({"code": code, "name": _clean_display_name(name), "values": vals})
 
     rows = apply_value_overrides_to_rows(rows, years, str(group.get("id", "")), project_id)
     return {"sheet_title": ws.title, "years": years, "rows": rows}
@@ -3093,6 +3619,14 @@ def _find_bs_subject_name(wb, code: str, project_id: Optional[str] = None) -> st
         if str(r.get("code", "")).strip().upper() == code_u:
             return str(r.get("name", "")).strip()
     return ""
+
+
+def _clean_display_name(text: Any) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    # Keep inner punctuation, remove only stale trailing colon artifacts.
+    return re.sub(r"[：:]+$", "", s).strip()
 
 
 def _normalize_subject_key(text: Any) -> str:
@@ -3878,7 +4412,8 @@ def build_income_analysis_map(wb, project_id: str) -> Dict[str, Any]:
 
     is_group = next((g for g in SHEET_GROUPS if g.get("id") == "is"), None)
     is_data = read_sheet_rows(wb, is_group, project_id=project_id) if is_group else {"years": [], "rows": []}
-    display_years = _year_seq((is_data.get("years", []) or parse_years_from_sheet(ws))[:3])
+    raw_years = _year_seq((is_data.get("years", []) or parse_years_from_sheet(ws))[:3])
+    display_years = _select_analysis_periods_for_group("is", raw_years)
     if len(display_years) < 2:
         return {"sheet_title": ws.title, "years": display_years, "tree": [], "nodes": []}
     years = list(display_years)
@@ -5253,6 +5788,173 @@ def get_value_overrides(store: Dict[str, Any]) -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def get_financing_inputs(store: Dict[str, Any]) -> Dict[str, Any]:
+    raw = store.get("financing_inputs", {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def _safe_period_last_annual(periods: List[str]) -> Optional[str]:
+    ys = [y for y in _period_seq(periods) if _is_annual_period(y)]
+    return ys[-1] if ys else None
+
+
+def _find_row_by_code_or_name(rows: List[Dict[str, Any]], code: str, name_keywords: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    c = str(code or "").strip().upper()
+    if c:
+        for r in rows:
+            if str(r.get("code", "")).strip().upper() == c:
+                return r
+    kws = [str(x).strip() for x in (name_keywords or []) if str(x).strip()]
+    if kws:
+        for r in rows:
+            nm = str(r.get("name", "")).strip()
+            if any(k in nm for k in kws):
+                return r
+    return None
+
+
+def _derive_financing_defaults_from_workbook(wb, project_id: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    try:
+        is_group = next((g for g in SHEET_GROUPS if str(g.get("id", "")) == "is"), None)
+        bs_group = next((g for g in SHEET_GROUPS if str(g.get("id", "")) == "bs"), None)
+        is_rows: List[Dict[str, Any]] = []
+        is_years: List[str] = []
+        if is_group:
+            is_data = read_sheet_rows(wb, is_group, project_id=project_id)
+            is_rows = is_data.get("rows", []) or []
+            is_years = is_data.get("years", []) or []
+        y_last = _safe_period_last_annual(is_years)
+        if y_last:
+            rev_row = _find_row_by_code_or_name(is_rows, "IS001", ["营业总收入", "营业收入"])
+            cost_row = _find_row_by_code_or_name(is_rows, "IS002", ["营业总成本"])
+            sell_row = _find_row_by_code_or_name(is_rows, "", ["销售费用"])
+            admin_row = _find_row_by_code_or_name(is_rows, "", ["管理费用"])
+            rd_row = _find_row_by_code_or_name(is_rows, "", ["研发费用"])
+            fin_row = _find_row_by_code_or_name(is_rows, "", ["财务费用"])
+            rev = normalize_num((rev_row or {}).get("values", {}).get(y_last))
+            cost = normalize_num((cost_row or {}).get("values", {}).get(y_last))
+            sell = normalize_num((sell_row or {}).get("values", {}).get(y_last))
+            admin = normalize_num((admin_row or {}).get("values", {}).get(y_last))
+            rd = normalize_num((rd_row or {}).get("values", {}).get(y_last))
+            fin = normalize_num((fin_row or {}).get("values", {}).get(y_last))
+            if rev is not None:
+                out["target_revenue"] = float(rev)
+            if rev not in (None, 0) and cost is not None:
+                ccr = float(cost) / float(rev)
+                if ccr > 0:
+                    out["operating_cost_ratio"] = ccr
+                    out["gross_margin_pct"] = max(0.0, 1.0 - ccr)
+            if rev not in (None, 0):
+                var_exp = 0.0
+                for x in [sell, admin, rd, fin]:
+                    if x is not None:
+                        var_exp += float(x)
+                if var_exp > 0:
+                    out["variable_expense_ratio"] = var_exp / float(rev)
+
+        ws_ratio = get_sheet_by_loose_name(wb, ["财务比率", "财务指标", "财务指标表"])
+        if ws_ratio is not None:
+            ratio_data = read_ratio_rows(ws_ratio)
+            r_year = _safe_period_last_annual(ratio_data.get("years", []) or [])
+            r_rows = ratio_data.get("rows", []) or []
+            if r_year:
+                by_code = {str(r.get("code", "")).strip().lower(): r for r in r_rows}
+                ar = normalize_num((by_code.get("ar_turnover", {}) or {}).get("values", {}).get(r_year))
+                inv = normalize_num((by_code.get("inventory_turnover", {}) or {}).get("values", {}).get(r_year))
+                if ar not in (None, 0):
+                    out["receivable_days"] = 365.0 / float(ar)
+                if inv not in (None, 0):
+                    out["inventory_days"] = 365.0 / float(inv)
+                gm = normalize_num((by_code.get("gross_margin", {}) or {}).get("values", {}).get(r_year))
+                if gm is not None:
+                    out["gross_margin_pct"] = float(gm if abs(gm) > 1 else gm)
+
+        if bs_group:
+            bs_data = read_sheet_rows(wb, bs_group, project_id=project_id)
+            bs_rows = bs_data.get("rows", []) or []
+            b_year = _safe_period_last_annual(bs_data.get("years", []) or [])
+            if b_year:
+                by_code = {str(r.get("code", "")).strip().upper(): r for r in bs_rows}
+                eq = normalize_num((by_code.get("BS104", {}) or {}).get("values", {}).get(b_year))
+                cur_liab = normalize_num((by_code.get("BS089", {}) or {}).get("values", {}).get(b_year))
+                non_cur_liab = normalize_num((by_code.get("BS102", {}) or {}).get("values", {}).get(b_year))
+                if eq is not None:
+                    out["current_equity_funds"] = float(eq)
+                if cur_liab is not None:
+                    out["current_other_funding"] = float(cur_liab) * 0.35
+                    out["current_operating_occupation"] = float(cur_liab) * 0.25
+                    out["current_payable_occupation"] = float(cur_liab) * 0.20
+                if non_cur_liab is not None:
+                    out["current_stable_loans"] = float(non_cur_liab)
+    except Exception:
+        return out
+    return out
+
+
+def _derive_actual_occupation_from_workbook(wb, project_id: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "period": "",
+        "components": [
+            {"item_id": "cash", "label": "货币资金（银行存款）", "amount": 0.0},
+            {"item_id": "inventory", "label": "存货", "amount": 0.0},
+            {"item_id": "ar_notes", "label": "应收票据及应收账款", "amount": 0.0},
+            {"item_id": "prepayments", "label": "预付款项", "amount": 0.0},
+            {"item_id": "other_ar", "label": "其他应收款", "amount": 0.0},
+            {"item_id": "other_occ", "label": "其他占用", "amount": 0.0},
+        ],
+        "total": 0.0,
+    }
+    try:
+        bs_group = next((g for g in SHEET_GROUPS if str(g.get("id", "")) == "bs"), None)
+        if not bs_group:
+            return out
+        bs_data = read_sheet_rows(wb, bs_group, project_id=project_id)
+        bs_rows = bs_data.get("rows", []) or []
+        years = bs_data.get("years", []) or []
+        y = _safe_period_last_annual(years)
+        if not y:
+            seq = _period_seq(years)
+            y = seq[-1] if seq else ""
+        out["period"] = y or ""
+        if not y:
+            return out
+
+        row_cash = _find_row_by_code_or_name(bs_rows, "BS001", ["货币资金", "银行存款"])
+        row_inventory = _find_row_by_code_or_name(bs_rows, "BS020", ["存货"])
+        row_ar_combo = _find_row_by_code_or_name(bs_rows, "", ["应收票据及应收账款"])
+        row_ar_note = _find_row_by_code_or_name(bs_rows, "BS003", ["应收票据"])
+        row_ar = _find_row_by_code_or_name(bs_rows, "BS004", ["应收账款"])
+        row_prepay = _find_row_by_code_or_name(bs_rows, "BS007", ["预付款项"])
+        row_other_ar = _find_row_by_code_or_name(bs_rows, "BS011", ["其他应收款"])
+
+        cash = float(normalize_num((row_cash or {}).get("values", {}).get(y)) or 0.0)
+        inventory = float(normalize_num((row_inventory or {}).get("values", {}).get(y)) or 0.0)
+        if row_ar_combo is not None:
+            ar_notes = float(normalize_num((row_ar_combo or {}).get("values", {}).get(y)) or 0.0)
+        else:
+            ar_notes = float(normalize_num((row_ar_note or {}).get("values", {}).get(y)) or 0.0) + float(
+                normalize_num((row_ar or {}).get("values", {}).get(y)) or 0.0
+            )
+        prepay = float(normalize_num((row_prepay or {}).get("values", {}).get(y)) or 0.0)
+        other_ar = float(normalize_num((row_other_ar or {}).get("values", {}).get(y)) or 0.0)
+
+        vals = {
+            "cash": cash,
+            "inventory": inventory,
+            "ar_notes": ar_notes,
+            "prepayments": prepay,
+            "other_ar": other_ar,
+            "other_occ": 0.0,
+        }
+        for comp in out["components"]:
+            comp["amount"] = round(float(vals.get(str(comp.get("item_id", "")), 0.0)), 2)
+        out["total"] = round(sum(float(x.get("amount", 0.0)) for x in out["components"]), 2)
+        return out
+    except Exception:
+        return out
+
+
 def apply_value_overrides_to_rows(
     rows: List[Dict[str, Any]],
     years: List[str],
@@ -5548,21 +6250,6 @@ def _read_rule_sheet(source_id: str, sheet_name: str) -> Dict[str, Any]:
     wb = load_workbook(p, data_only=False)
     ws = get_sheet_by_loose_name(wb, [sheet_name])
     if ws is None:
-        if source_id == "ratio_rulebook" and sheet_name == "period_applicability":
-            headers = ["rule_id", "period_mode", "match_type", "match_value", "applicability", "note", "enabled", "sort_order"]
-            rows = []
-            for i, r in enumerate(DEFAULT_PERIOD_APPLICABILITY_RULES, start=2):
-                obj = {"_row": i}
-                for h in headers:
-                    obj[h] = r.get(h)
-                rows.append(obj)
-            return {
-                "source_id": source_id,
-                "sheet_name": sheet_name,
-                "path": str(p),
-                "headers": headers,
-                "rows": rows,
-            }
         raise ValueError(f"sheet not found: {sheet_name}")
     headers = [str(ws.cell(1, c).value or "").strip() for c in range(1, ws.max_column + 1)]
     if not any(headers):
@@ -5641,10 +6328,7 @@ def _save_rule_sheet(source_id: str, sheet_name: str, headers: List[str], rows: 
     wb = load_workbook(p, data_only=False)
     ws = get_sheet_by_loose_name(wb, [sheet_name])
     if ws is None:
-        if source_id == "ratio_rulebook" and sheet_name == "period_applicability":
-            ws = wb.create_sheet(sheet_name)
-        else:
-            raise ValueError(f"sheet not found: {sheet_name}")
+        raise ValueError(f"sheet not found: {sheet_name}")
     issues = _validate_rule_rows(sheet_name, headers, rows)
     has_error = any(x.get("level") == "error" for x in issues)
     if has_error:
@@ -5732,6 +6416,7 @@ def render_index() -> str:
         '<a class="card" href="/analysis/liabilities"><h3>负债分析</h3><p>查看规模变化与结构占比</p></a>'
         '<a class="card" href="/analysis/summary"><h3>分析汇总</h3><p>汇总科目综合描述与确认</p></a>'
         '<a class="card" href="/analysis/income"><h3>收入分析</h3><p>经常性/非经常性收益拆分</p></a>'
+        '<a class="card" href="/analysis/financing"><h3>融资额度测算</h3><p>资金需求、覆盖能力与结构调整</p></a>'
         '<a class="card" href="/analysis/ratios"><h3>财务指标分析</h3><p>指标趋势、判断与确认</p></a>'
         '<a class="card" href="/analysis/key-ratios"><h3>重要指标分析</h3><p>ROE与毛利率深度分析</p></a>'
         '<a class="card" href="/rules"><h3>规则配置</h3><p>阈值与文本模板可视化维护</p></a>'
@@ -6109,7 +6794,7 @@ let ratioRuleSheet = '';
 let activeRow = -1;
 let pendingLocate = null;
 const RATIO_OVERALL_SHEETS = ['indicator_tree', 'indicator_catalog'];
-const RATIO_RULE_SHEETS = ['trend_rules', 'judgement_rules', 'alert_rules', 'period_applicability', 'display_policy', 'text_templates'];
+const RATIO_RULE_SHEETS = ['trend_rules', 'judgement_rules', 'alert_rules', 'display_policy', 'text_templates'];
 const DEFAULT_SHEET_BY_SOURCE = {
   ratio_rulebook: 'text_templates',
   profit_rulebook: 'analysis_text_templates',
@@ -6157,6 +6842,13 @@ const ZH_NAME_MAP = {
   // 常规指标模板
   'indicator_value': '指标数值描述',
   'indicator_trend': '指标趋势描述',
+  'ratio_indicator_value_full_3y': '指标数值描述-三年完整',
+  'ratio_indicator_trend_full_3y': '指标趋势描述-三年完整',
+  'ratio_indicator_value_full_2y': '指标数值描述-两年完整',
+  'ratio_indicator_trend_full_2y': '指标趋势描述-两年完整',
+  'ratio_indicator_value_full_2y_plus_interim': '指标数值描述-两年加一期期间',
+  'ratio_indicator_trend_full_2y_plus_interim': '指标趋势描述-两年加一期期间',
+  'ratio_indicator_downgrade_to_full_2y_note': '期间降级提示-两年完整',
   // 重点指标模板
   'roe_headline': 'ROE总述',
   'roe_missing_years': 'ROE缺年度提示',
@@ -6268,9 +6960,11 @@ const SHEET_ZH_MAP = {
   'trend_rules': '趋势规则',
   'judgement_rules': '判断词规则',
   'alert_rules': '预警规则',
-  'period_applicability': '期间适用性矩阵',
   'driver_thresholds': '驱动阈值',
-  'narrative_templates': '叙述模板'
+  'narrative_templates': '叙述模板',
+  'base_params': '基础参数',
+  'structure_targets': '结构目标',
+  'adjustment_rules': '调整规则'
 };
 const FIELD_ZH_MAP = {
   'tpl_id': '模板ID',
@@ -6336,14 +7030,16 @@ const FIELD_ZH_MAP = {
   'value': '值',
   'field': '字段',
   'desc_zh': '中文说明',
+  'param_id': '参数ID',
+  'group': '分组',
+  'source_name': '来源名称',
+  'target_pct': '目标占比',
+  'min_pct': '下限占比',
+  'max_pct': '上限占比',
   'sort_order': '排序',
   'unit': '单位',
   'direction': '方向'
-  ,'period_mode': '期间模式'
-  ,'match_type': '匹配类型'
-  ,'match_value': '匹配值'
-  ,'applicability': '适用性'
-  ,'note': '提示语'
+  ,'period_applicable': '期间适用'
 };
 const METRIC_ZH_MAP = {
   'rev_yoy': '收入同比变动',
@@ -6429,8 +7125,7 @@ function renderAlertExprHelp(){
   `;
 }
 function indicatorApplicable(){
-  const s = activeSheetName();
-  return isRatioSource() && isRatioRuleSheet(s) && s !== 'period_applicability';
+  return isRatioSource() && isRatioRuleSheet(activeSheetName());
 }
 function rowIndicatorId(row){
   const iid = String(row?.indicator_id ?? '').trim();
@@ -7187,7 +7882,7 @@ function renderTree() {{
     const active = n.node_id === activeNodeId ? 'active' : '';
     const nd = nodeById(n.node_id) || {{}};
     const app = String(nd.period_applicability || '').toLowerCase();
-    const tag = app === 'na' ? ' [不适用]' : (app === 'caution' ? ' [谨慎]' : '');
+    const tag = app === 'na' ? ' [不适用]' : (app === 'caution' ? ' [谨慎]' : ' [可用]');
     return `<div class="node ${{active}}" data-id="${{esc(n.node_id)}}" style="padding-left:${{10 + d * 16}}px;">${{esc(n.node_id)}} ${{esc(n.label)}}${{esc(tag)}}</div>`;
   }}).join('');
   box.querySelectorAll('.node[data-id]').forEach(el => {{
@@ -7256,11 +7951,331 @@ async function reloadData() {{
     activeNodeId = cache.tree[0].node_id;
   }}
   renderNode();
-  document.getElementById('status').textContent = `来源Sheet: ${{cache.sheet_title || '-'}} | 年份: ${{(cache.years||[]).join(',')}}`;
+  document.getElementById('status').textContent = `来源Sheet: ${{cache.sheet_title || '-'}} | 分析期间: ${{(cache.years||[]).join(',')}}`;
 }}
 function exportExcel() {{
   const url = `/api/analysis/income/export?project_id=${{encodeURIComponent(PROJECT_ID)}}`;
   window.location.href = url;
+}}
+reloadData();
+</script>
+</body>
+</html>"""
+
+
+def render_financing_analysis_page(project_id: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>融资额度测算</title>
+  <style>
+    :root {{ --bg:#f6f8fb; --card:#fff; --ink:#111827; --line:#d1d5db; --muted:#6b7280; --acc:#0f766e; }}
+    body {{ margin:0; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background:var(--bg); color:var(--ink); }}
+    .top {{ position:sticky; top:0; background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+    .btn {{ border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 10px; text-decoration:none; color:inherit; cursor:pointer; }}
+    .btn.primary {{ background:var(--acc); color:#fff; border-color:var(--acc); }}
+    .muted {{ color:var(--muted); font-size:12px; }}
+    .wrap {{ display:grid; grid-template-columns:minmax(560px,1fr) minmax(560px,1fr); gap:12px; margin:12px auto; padding:0 16px 20px; }}
+    .panel {{ background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
+    .panel h3 {{ margin:0; padding:10px 12px; border-bottom:1px solid var(--line); background:#fafafa; font-size:14px; }}
+    .box {{ padding:10px 12px; }}
+    table {{ border-collapse:collapse; width:100%; }}
+    th,td {{ border-bottom:1px solid #eef2f7; padding:6px 8px; text-align:left; font-size:12px; vertical-align:top; }}
+    th {{ background:#f9fafb; }}
+    input.num {{ width:110px; }}
+    .desc {{ white-space:pre-wrap; line-height:1.6; font-size:13px; }}
+    .grid2 {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
+    .kpi {{ border:1px solid #e5e7eb; border-radius:8px; padding:8px; background:#fff; }}
+    .kpi .t {{ font-size:12px; color:#6b7280; }}
+    .kpi .v {{ font-size:18px; font-weight:700; margin-top:4px; }}
+    .ok {{ color:#166534; }}
+    .bad {{ color:#991b1b; }}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <a class="btn" href="/?project_id={project_id}">返回主页</a>
+    <strong>融资额度与结构测算</strong>
+    <span class="muted">项目ID: {project_id}</span>
+    <span class="muted" id="status"></span>
+    <button class="btn primary" onclick="reloadData()">刷新</button>
+  </div>
+  <div class="wrap">
+    <div style="display:grid; gap:12px;">
+      <div class="panel">
+        <h3>基础参数</h3>
+        <div class="box muted">从左至右：分组 / 参数 / 当前值 / 目标值 / 单位 / 说明。默认值来自基础报表推导，可手动改。</div>
+        <div class="box" id="paramsTbl"></div>
+        <div class="box" style="padding-top:0;"><button class="btn primary" onclick="saveParamsOnly()">保存基础参数并测算</button></div>
+      </div>
+      <div class="panel">
+        <h3>资金占用匹配</h3>
+        <div class="box desc" id="occSummary"></div>
+        <div class="box" id="occWords"></div>
+        <div class="box" id="occTbl"></div>
+        <div class="box" style="padding-top:0;"><button class="btn primary" onclick="saveOccOnly()">保存并计算</button></div>
+      </div>
+      <div class="panel">
+        <h3>合理性审查清单</h3>
+        <div class="box" id="checksTbl"></div>
+      </div>
+      <div class="box" style="padding:0;">
+        <button class="btn primary" onclick="saveInputs()">保存参数并重算</button>
+      </div>
+    </div>
+    <div style="display:grid; gap:12px;">
+      <div class="panel">
+        <h3>测算结果</h3>
+        <div class="box grid2" id="kpiBox"></div>
+      </div>
+      <div class="panel" style="margin-top:84px;">
+        <h3>资金供给匹配</h3>
+        <div class="box muted">从左至右：来源、当前金额、当前结构、融资（调整）额度、目标金额、目标结构。结构按金额自动计算。</div>
+        <div class="box" id="structureTbl"></div>
+        <div class="box" style="padding-top:0;"><button class="btn primary" onclick="saveStructureOnly()">保存资金供给</button></div>
+      </div>
+      <div class="panel">
+        <h3>结构调整建议</h3>
+        <div class="box" id="planTbl"></div>
+      </div>
+      <div class="panel">
+        <h3>摘要判断</h3>
+        <div class="box desc" id="summaryText"></div>
+      </div>
+    </div>
+  </div>
+<script>
+const PROJECT_ID = {json.dumps(project_id)};
+let cache = null;
+function esc(s) {{
+  return (s ?? '').toString().replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+}}
+function renderTable(rows, cols) {{
+  if (!rows || !rows.length) return '<div class="muted">暂无</div>';
+  const head = `<tr>${{cols.map(c=>`<th>${{esc(c.label)}}</th>`).join('')}}</tr>`;
+  const body = rows.map(r=>`<tr>${{cols.map(c=>`<td>${{esc(r[c.key])}}</td>`).join('')}}</tr>`).join('');
+  return `<table><thead>${{head}}</thead><tbody>${{body}}</tbody></table>`;
+}}
+function money(v) {{
+  const n = Number(v || 0);
+  return n.toLocaleString(undefined, {{minimumFractionDigits:2, maximumFractionDigits:2}});
+}}
+function render() {{
+  const d = cache || {{}};
+  const p = d.params || [];
+  document.getElementById('paramsTbl').innerHTML = (() => {{
+    if (!p.length) return '<div class="muted">暂无</div>';
+    const head = '<tr><th>分组</th><th>参数</th><th>当前值</th><th>目标值</th><th>单位</th><th>说明</th></tr>';
+    const body = p.map(r => `<tr data-param="${{esc(r.param_id)}}">
+      <td>${{esc(r.group)}}</td>
+      <td>${{esc(r.label_zh)}}</td>
+      <td><input class="num" data-k="current" value="${{esc(r.current_value)}}"/></td>
+      <td><input class="num" data-k="target" value="${{esc(r.target_value)}}"/></td>
+      <td>${{esc(r.unit)}}</td>
+      <td>${{esc(r.notes||'')}}</td>
+    </tr>`).join('');
+    return `<table><thead>${{head}}</thead><tbody>${{body}}</tbody></table>`;
+  }})();
+  const srows = d.structure_plan || [];
+  document.getElementById('structureTbl').innerHTML = (() => {{
+    if (!srows.length) return '<div class="muted">暂无</div>';
+    const head = '<tr><th>来源</th><th>当前金额</th><th>当前结构(%)</th><th>融资（调整）额度</th><th>目标金额</th><th>目标结构(%)</th></tr>';
+    const body = srows.map(r => `<tr data-src="${{esc(r.source_id)}}">
+      <td>${{esc(r.source_name)}}</td>
+      <td><input class="num" data-k="current_amt" value="${{esc(r.current_amt)}}"/></td>
+      <td>${{esc(r.current_pct)}}</td>
+      <td><input class="num" data-k="adjust_amt" value="${{esc(r.adjust_amt)}}"/></td>
+      <td>${{esc(r.target_amt)}}</td>
+      <td>${{esc(r.target_pct)}}</td>
+    </tr>`).join('');
+    return `<table><thead>${{head}}</thead><tbody>${{body}}</tbody></table>`;
+  }})();
+  document.getElementById('checksTbl').innerHTML = renderTable(d.checks || [], [
+    {{key:'item',label:'审查项'}},{{key:'status',label:'结果'}},{{key:'message',label:'判定依据'}}
+  ]);
+  const m = d.metrics || {{}};
+  const kpis = [
+    ['需求周期(天)', m.demand_cycle_days],
+    ['应付天数(供给口径参考)', m.payable_days],
+    ['日均营业成本(万元)', m.daily_operating_cost],
+    ['变动费用金额(万元)', m.variable_expense_amount],
+    ['固定费用金额(年度口径,万元)', m.fixed_expense_amount],
+    ['固定费用占用(周期口径,万元)', m.fixed_expense_occupied],
+    ['毛利额(万元)', m.gross_profit_amount],
+    ['费用合计(万元)', m.expense_total_amount],
+    ['毛利覆盖倍数(x)', m.gp_cover_ratio],
+    ['安全垫资金额(万元)', m.safety_buffer_amount],
+    ['资金需求总量(万元)', m.demand_total],
+  ];
+  document.getElementById('kpiBox').innerHTML = kpis.map(x => {{
+    return `<div class="kpi"><div class="t">${{esc(x[0])}}</div><div class="v">${{money(x[1])}}</div></div>`;
+  }}).join('');
+  const om = d.occupation_match || {{}};
+  const ratioText = (om.match_ratio===null || om.match_ratio===undefined) ? '待判断' : `${{money(om.match_ratio)}}%`;
+  document.getElementById('occSummary').textContent =
+    `期间：${{om.period || '-'}}；A实际占用=${{money(om.actual_total)}}万元；B理论需求=${{money(om.theoretical_total)}}万元；`
+    + `A-B=${{money(om.match_diff)}}万元；A/B=${{ratioText}}；判定：${{om.status || '待判断'}}。`;
+  document.getElementById('occWords').innerHTML =
+    `<table><thead><tr><th>偏高判定词</th><th>偏低判定词</th><th>匹配判定词</th></tr></thead><tbody><tr>
+      <td><input data-k="wh" value="${{esc(om.word_high || '占用偏高')}}"/></td>
+      <td><input data-k="wl" value="${{esc(om.word_low || '占用偏低')}}"/></td>
+      <td><input data-k="wo" value="${{esc(om.word_ok || '基本匹配')}}"/></td>
+    </tr></tbody></table>`;
+  const orows = om.components || [];
+  document.getElementById('occTbl').innerHTML = (() => {{
+    if (!orows.length) return '<div class="muted">暂无</div>';
+    const total = Number(om.actual_total || 0);
+    const head = '<tr><th>占用科目</th><th>金额(万元)</th><th>占比</th></tr>';
+    const body = orows.map(r => {{
+      const amt = Number(r.amount || 0);
+      const pct = total>0 ? (amt*100/total) : 0;
+      return `<tr data-occ="${{esc(r.item_id)}}">
+        <td>${{esc(r.label)}}</td>
+        <td><input class="num" data-k="amount" value="${{esc(amt)}}"/></td>
+        <td>${{money(pct)}}%</td>
+      </tr>`;
+    }}).join('');
+    return `<table><thead>${{head}}</thead><tbody>${{body}}</tbody></table>`;
+  }})();
+  document.getElementById('planTbl').innerHTML = renderTable(d.structure_plan || [], [
+    {{key:'source_name',label:'来源'}},{{key:'current_amt',label:'当前金额'}},{{key:'current_pct',label:'当前结构(%)'}},
+    {{key:'adjust_amt',label:'融资（调整）额度'}},{{key:'target_amt',label:'目标金额'}},{{key:'target_pct',label:'目标结构(%)'}}
+  ]);
+  document.getElementById('summaryText').textContent = d.summary_text || '';
+  document.getElementById('status').textContent = `更新时间：${{new Date().toLocaleString()}}`;
+}}
+async function saveInputs() {{
+  const params = [];
+  document.querySelectorAll('#paramsTbl tr[data-param]').forEach(tr => {{
+    params.push({{
+      param_id: tr.getAttribute('data-param'),
+      current: Number((tr.querySelector('input[data-k=\"current\"]')?.value || '0').trim() || 0),
+      target: Number((tr.querySelector('input[data-k=\"target\"]')?.value || '0').trim() || 0),
+    }});
+  }});
+  const deltas = [];
+  document.querySelectorAll('#structureTbl tr[data-src]').forEach(tr => {{
+    deltas.push({{
+      source_id: tr.getAttribute('data-src'),
+      current_amt: Number((tr.querySelector('input[data-k=\"current_amt\"]')?.value || '0').trim() || 0),
+      adjust_amt: Number((tr.querySelector('input[data-k=\"adjust_amt\"]')?.value || '0').trim() || 0),
+    }});
+  }});
+  const occs = [];
+  document.querySelectorAll('#occTbl tr[data-occ]').forEach(tr => {{
+    occs.push({{
+      item_id: tr.getAttribute('data-occ'),
+      amount: Number((tr.querySelector('input[data-k=\"amount\"]')?.value || '0').trim() || 0),
+    }});
+  }});
+  const wtbl = document.querySelector('#occWords');
+  const match_words = wtbl ? {{
+    high: (wtbl.querySelector('input[data-k=\"wh\"]')?.value || '').trim(),
+    low: (wtbl.querySelector('input[data-k=\"wl\"]')?.value || '').trim(),
+    ok: (wtbl.querySelector('input[data-k=\"wo\"]')?.value || '').trim(),
+  }} : {{}};
+  const res = await fetch('/api/analysis/financing/save', {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{project_id: PROJECT_ID, params, deltas, occs, match_words}})
+  }});
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{
+    document.getElementById('status').textContent = data.error || '保存失败';
+    return;
+  }}
+  await reloadData();
+}}
+async function saveParamsOnly() {{
+  const params = [];
+  document.querySelectorAll('#paramsTbl tr[data-param]').forEach(tr => {{
+    params.push({{
+      param_id: tr.getAttribute('data-param'),
+      current: Number((tr.querySelector('input[data-k=\"current\"]')?.value || '0').trim() || 0),
+      target: Number((tr.querySelector('input[data-k=\"target\"]')?.value || '0').trim() || 0),
+    }});
+  }});
+  const wtbl = document.querySelector('#occWords');
+  const match_words = wtbl ? {{
+    high: (wtbl.querySelector('input[data-k=\"wh\"]')?.value || '').trim(),
+    low: (wtbl.querySelector('input[data-k=\"wl\"]')?.value || '').trim(),
+    ok: (wtbl.querySelector('input[data-k=\"wo\"]')?.value || '').trim(),
+  }} : {{}};
+  const res = await fetch('/api/analysis/financing/save', {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{project_id: PROJECT_ID, params, deltas: [], occs: [], match_words}})
+  }});
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{
+    document.getElementById('status').textContent = data.error || '保存失败';
+    return;
+  }}
+  await reloadData();
+}}
+async function saveStructureOnly() {{
+  const deltas = [];
+  document.querySelectorAll('#structureTbl tr[data-src]').forEach(tr => {{
+    deltas.push({{
+      source_id: tr.getAttribute('data-src'),
+      current_amt: Number((tr.querySelector('input[data-k=\"current_amt\"]')?.value || '0').trim() || 0),
+      adjust_amt: Number((tr.querySelector('input[data-k=\"adjust_amt\"]')?.value || '0').trim() || 0),
+    }});
+  }});
+  const wtbl = document.querySelector('#occWords');
+  const match_words = wtbl ? {{
+    high: (wtbl.querySelector('input[data-k=\"wh\"]')?.value || '').trim(),
+    low: (wtbl.querySelector('input[data-k=\"wl\"]')?.value || '').trim(),
+    ok: (wtbl.querySelector('input[data-k=\"wo\"]')?.value || '').trim(),
+  }} : {{}};
+  const res = await fetch('/api/analysis/financing/save', {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{project_id: PROJECT_ID, params: [], deltas, occs: [], match_words}})
+  }});
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{
+    document.getElementById('status').textContent = data.error || '保存失败';
+    return;
+  }}
+  await reloadData();
+}}
+async function saveOccOnly() {{
+  const occs = [];
+  document.querySelectorAll('#occTbl tr[data-occ]').forEach(tr => {{
+    occs.push({{
+      item_id: tr.getAttribute('data-occ'),
+      amount: Number((tr.querySelector('input[data-k=\"amount\"]')?.value || '0').trim() || 0),
+    }});
+  }});
+  const wtbl = document.querySelector('#occWords');
+  const match_words = wtbl ? {{
+    high: (wtbl.querySelector('input[data-k=\"wh\"]')?.value || '').trim(),
+    low: (wtbl.querySelector('input[data-k=\"wl\"]')?.value || '').trim(),
+    ok: (wtbl.querySelector('input[data-k=\"wo\"]')?.value || '').trim(),
+  }} : {{}};
+  const res = await fetch('/api/analysis/financing/save', {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{project_id: PROJECT_ID, params: [], deltas: [], occs, match_words}})
+  }});
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{
+    document.getElementById('status').textContent = data.error || '保存失败';
+    return;
+  }}
+  await reloadData();
+}}
+async function reloadData() {{
+  const res = await fetch(`/api/analysis/financing?project_id=${{encodeURIComponent(PROJECT_ID)}}`);
+  cache = await res.json();
+  if (!res.ok) {{
+    document.getElementById('status').textContent = cache.error || '读取失败';
+    return;
+  }}
+  render();
 }}
 reloadData();
 </script>
@@ -7360,7 +8375,7 @@ function renderNode() {{
   const app = String(n.period_applicability || '').toLowerCase();
   const mode = String(n.period_mode || cache.period_mode || '');
   const appTag = app === 'na' ? '不适用' : (app === 'caution' ? '谨慎' : '可用');
-  document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析｜${{mode==='monitor'?'期间监测':'年度分析'}}｜${{appTag}}）`;
+  document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析｜${{mode==='monitor'?'期间监测':'年度分析'}}${{appTag}}）`;
   document.getElementById('autoText').textContent = n.auto_text || '';
   document.getElementById('manualText').value = n.manual_text || n.auto_text || '';
   document.getElementById('manualConfirmed').checked = !!n.confirmed;
@@ -7492,11 +8507,19 @@ function renderNode() {{
   renderTree();
   const n = nodeById(activeNodeId);
   if (!n) return;
-  document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析）`;
+  const mode = String(n.period_mode || cache.period_mode || '');
+  const app = String(n.period_applicability || '');
+  const appTag = app === 'na' ? '不适用' : (app === 'caution' ? '谨慎' : '可用');
+  document.getElementById('nodeTitle').textContent = `${{n.node_id}} ${{n.label}}（自动分析｜${{mode==='monitor'?'期间监测':'年度分析'}}${{appTag}}）`;
   document.getElementById('autoText').textContent = n.auto_text || '';
   document.getElementById('manualText').value = n.manual_text || n.auto_text || '';
   document.getElementById('manualConfirmed').checked = !!n.confirmed;
   document.getElementById('saveHint').textContent = n.confirmed ? '当前已确认' : '';
+  const ay = (n.analysis_years || []).join(',');
+  const base = `来源Sheet: ${{cache.sheet_title || '-'}} | 期间: ${{(cache.years||[]).join(',')}}`;
+  document.getElementById('status').textContent = ay
+    ? `${{base}} | 节点分析期间: ${{ay}}`
+    : base;
 }}
 async function saveActive() {{
   const n = nodeById(activeNodeId);
@@ -7531,7 +8554,9 @@ async function reloadData() {{
     activeNodeId = cache.tree[0].node_id;
   }}
   renderNode();
-  document.getElementById('status').textContent = `来源Sheet: ${{cache.sheet_title || '-'}} | 年份: ${{(cache.years||[]).join(',')}}`;
+  if (!activeNodeId) {{
+    document.getElementById('status').textContent = `来源Sheet: ${{cache.sheet_title || '-'}} | 期间: ${{(cache.years||[]).join(',')}}`;
+  }}
 }}
 reloadData();
 </script>
@@ -7848,7 +8873,15 @@ async function reloadData() {{
 
 function render() {{
   const years = cache.years || [];
-  document.getElementById('status').textContent = `行数 ${{cache.rows.length}}` + (cache.sheet_title ? ` | 来源Sheet: ${{cache.sheet_title}}` : '');
+  const analysisYears = cache.analysis_years || years;
+  const sameWindow = JSON.stringify(years) === JSON.stringify(analysisYears);
+  let status = `行数 ${{cache.rows.length}}`;
+  if (cache.sheet_title) status += ` | 来源Sheet: ${{cache.sheet_title}}`;
+  status += ` | 期间: ${{years.join(',')}}`;
+  status += sameWindow
+    ? ` | 分析期间: ${{analysisYears.join(',')}}`
+    : ` | 分析期间: ${{analysisYears.join(',')}}（已按口径筛选）`;
+  document.getElementById('status').textContent = status;
   const head = (GROUP_ID === 'bs' || GROUP_ID === 'is' || GROUP_ID === 'cf')
     ? `<tr><th style="min-width:90px;">科目编码</th><th style="min-width:180px;">科目</th>${{years.map(y=>`<th>${{y}}</th>`).join('')}}<th style="min-width:460px;">分析判断内容</th><th style="min-width:220px;">数据校验</th><th style="min-width:220px;">修改原因</th><th style="min-width:120px;">操作</th><th>确认</th></tr>`
     : `<tr><th style="min-width:90px;">科目编码</th><th style="min-width:180px;">科目</th>${{years.map(y=>`<th>${{y}}</th>`).join('')}}<th style="min-width:280px;">自动描述</th><th style="min-width:340px;">人工确认描述</th><th>确认</th></tr>`;
@@ -8374,6 +9407,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_html(render_income_analysis_page(self._project_id(qs)))
             return
 
+        if path == "/analysis/financing":
+            self._send_html(render_financing_analysis_page(self._project_id(qs)))
+            return
+
         if path == "/analysis/ratios":
             self._send_html(render_ratio_analysis_page(self._project_id(qs)))
             return
@@ -8411,6 +9448,7 @@ class AppHandler(BaseHTTPRequestHandler):
             sheet_data = read_sheet_rows(wb, group, project_id=project_id)
             years = sheet_data["years"]
             rows = sheet_data["rows"]
+            analysis_years = _select_analysis_periods_for_group(group_id, years)
             asset_analysis_map = build_asset_analysis_map(wb, project_id) if group_id == "bs" else {}
             liability_analysis_map = build_liability_analysis_map(wb, project_id) if group_id == "bs" else {}
 
@@ -8421,7 +9459,7 @@ class AppHandler(BaseHTTPRequestHandler):
             for r in rows:
                 key = make_entry_key(group_id, r["code"])
                 saved = entries.get(key, {})
-                r["auto_text"] = generate_auto_text(r["name"], r["values"], years)
+                r["auto_text"] = generate_auto_text(r["name"], r["values"], analysis_years)
                 r["manual_text"] = str(saved.get("manual_text", "") or "")
                 r["confirmed"] = bool(saved.get("confirmed", False))
                 if group_id == "bs":
@@ -8448,6 +9486,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     "group_label": group["label"],
                     "sheet_title": sheet_data["sheet_title"],
                     "years": years,
+                    "analysis_years": analysis_years,
                     "rows": rows,
                     "workbook": str(wb_path),
                 }
@@ -8547,6 +9586,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     "nodes": data.get("nodes", []),
                 }
             )
+            return
+
+        if path == "/api/analysis/financing":
+            project_id = self._project_id(qs)
+            wb_path = workbook_path(project_id)
+            wb = load_workbook(wb_path, data_only=False) if wb_path.exists() else None
+            payload = build_financing_analysis_payload(project_id, wb=wb)
+            if wb is not None:
+                wb.close()
+            self._send_json(payload)
             return
 
         if path == "/api/analysis/ratios":
@@ -8696,6 +9745,7 @@ class AppHandler(BaseHTTPRequestHandler):
             "/api/warnings/clear",
             "/api/template/ratio-indicator-import",
             "/api/detail/import",
+            "/api/analysis/financing/save",
         }:
             self._send_json({"error": "not found"}, status=404)
             return
@@ -8730,6 +9780,67 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result, status=400)
                 return
             self._send_json(result)
+            return
+
+        if parsed.path == "/api/analysis/financing/save":
+            project_id = normalize_project_id(str(body.get("project_id", DEFAULT_PROJECT_ID)))
+            params = body.get("params", [])
+            deltas = body.get("deltas", [])
+            occs = body.get("occs", [])
+            match_words = body.get("match_words", {})
+            if (
+                (not isinstance(params, list))
+                or (not isinstance(deltas, list))
+                or (not isinstance(occs, list))
+                or (not isinstance(match_words, dict))
+            ):
+                self._send_json({"ok": False, "error": "invalid params/deltas/occs/match_words"}, status=400)
+                return
+            store = load_store(project_id)
+            fin_inputs = get_financing_inputs(store)
+            pmap = fin_inputs.get("param_values", {}) if isinstance(fin_inputs.get("param_values"), dict) else {}
+            dmap = fin_inputs.get("structure_adjust_amt", {}) if isinstance(fin_inputs.get("structure_adjust_amt"), dict) else {}
+            cmap = fin_inputs.get("structure_current_amt", {}) if isinstance(fin_inputs.get("structure_current_amt"), dict) else {}
+            omap = fin_inputs.get("occupation_amounts", {}) if isinstance(fin_inputs.get("occupation_amounts"), dict) else {}
+            wmap = fin_inputs.get("match_words", {}) if isinstance(fin_inputs.get("match_words"), dict) else {}
+            for r in params:
+                pid = str((r or {}).get("param_id", "")).strip()
+                if not pid:
+                    continue
+                cur = _safe_float((r or {}).get("current"), None)
+                tgt = _safe_float((r or {}).get("target"), None)
+                if cur is None or tgt is None:
+                    continue
+                pmap[pid] = {"current": float(cur), "target": float(tgt)}
+            for r in deltas:
+                sid = str((r or {}).get("source_id", "")).strip()
+                if not sid:
+                    continue
+                cv = _safe_float((r or {}).get("current_amt"), None)
+                av = _safe_float((r or {}).get("adjust_amt"), None)
+                if cv is not None:
+                    cmap[sid] = float(cv)
+                if av is not None:
+                    dmap[sid] = float(av)
+            for r in occs:
+                iid = str((r or {}).get("item_id", "")).strip()
+                if not iid:
+                    continue
+                av = _safe_float((r or {}).get("amount"), None)
+                if av is not None:
+                    omap[iid] = float(av)
+            for k in ["high", "low", "ok"]:
+                v = str(match_words.get(k, "") or "").strip()
+                if v:
+                    wmap[k] = v
+            fin_inputs["param_values"] = pmap
+            fin_inputs["structure_adjust_amt"] = dmap
+            fin_inputs["structure_current_amt"] = cmap
+            fin_inputs["occupation_amounts"] = omap
+            fin_inputs["match_words"] = wmap
+            store["financing_inputs"] = fin_inputs
+            save_store(project_id, store)
+            self._send_json({"ok": True, "project_id": project_id})
             return
 
         if parsed.path == "/api/detail/import":
@@ -8774,12 +9885,15 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._send_json(result, status=400)
                     return
                 # invalidate runtime caches when rule sheets are edited
-                global _KEY_RATIO_RULES_CACHE, _MAIN_TEXT_TEMPLATE_CACHE, _MAIN_TEXT_TEMPLATE_UNIT_CACHE
+                global _KEY_RATIO_RULES_CACHE, _MAIN_TEXT_TEMPLATE_CACHE, _MAIN_TEXT_TEMPLATE_UNIT_CACHE, _FINANCING_RULES_CACHE, _FINANCING_RULES_CACHE_MTIME
                 if source_id in {"key_ratio_rulebook"}:
                     _KEY_RATIO_RULES_CACHE = None
                 if source_id in {"rulebook_main"}:
                     _MAIN_TEXT_TEMPLATE_CACHE = None
                     _MAIN_TEXT_TEMPLATE_UNIT_CACHE = None
+                if source_id in {"financing_rulebook"}:
+                    _FINANCING_RULES_CACHE = None
+                    _FINANCING_RULES_CACHE_MTIME = None
                 self._send_json(result)
             except FileNotFoundError as e:
                 self._send_json({"ok": False, "error": f"rule file not found: {e}"}, status=404)
